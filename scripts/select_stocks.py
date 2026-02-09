@@ -21,10 +21,11 @@ import sys
 
 warnings.filterwarnings('ignore')
 
-# 导入基本面分析模块和数据源适配层
+# 导入基本面分析模块、数据源适配层和公共技术指标
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fundamental_analyzer import FundamentalAnalyzer
 from data_source import DataSource
+from technical import calculate_ma, detect_highs_lows, analyze_ma_alignment, _safe_ma
 
 
 class TrendStockSelector:
@@ -57,12 +58,14 @@ class TrendStockSelector:
             'hs300': ('沪深300', 'sh.000300'),
             'zz500': ('中证500', 'sh.000905'),
             'sz50': ('上证50', 'sh.000016'),
-            'zz1000': ('中证1000', 'sh.000852'),
         }
 
         key = self.index.lower()
+        if key == 'zz1000':
+            print(f"⚠️ baostock 不支持中证1000成分股查询，将从全A股中选股...")
+            return self._get_all_a_stocks()
         if key not in index_map:
-            print(f"⚠️ 不支持的指数: {self.index}，支持: {', '.join(index_map.keys())}")
+            print(f"⚠️ 不支持的指数: {self.index}，支持: hs300, zz500, sz50")
             print("将使用沪深300")
             key = 'hs300'
 
@@ -89,8 +92,6 @@ class TrendStockSelector:
         """获取板块成分股（baostock 不支持板块，使用全市场）"""
         print(f"⚠️ baostock 不支持板块筛选，将从全市场选股...")
         return self._get_all_a_stocks()
-
-        return []
 
     def _get_all_a_stocks(self):
         """获取全A股列表（使用 baostock）"""
@@ -136,27 +137,21 @@ class TrendStockSelector:
             if df is None or df.empty or len(df) < 120:
                 return None
 
-            # 计算均线
-            df['MA5'] = df['收盘'].rolling(window=5).mean()
-            df['MA10'] = df['收盘'].rolling(window=10).mean()
-            df['MA20'] = df['收盘'].rolling(window=20).mean()
-            df['MA60'] = df['收盘'].rolling(window=60).mean()
-            df['MA120'] = df['收盘'].rolling(window=120).mean()
-            if len(df) >= 250:
-                df['MA250'] = df['收盘'].rolling(window=250).mean()
+            # 计算均线（使用公共模块）
+            calculate_ma(df, windows=[5, 10, 20, 60, 120, 250])
 
             latest = df.iloc[-1]
             price = latest['收盘']
             name = self.stock_names.get(stock_code, stock_code)
 
-            # === 均线排列分析 ===
-            ma5 = latest['MA5']
-            ma10 = latest['MA10']
-            ma20 = latest['MA20']
-            ma60 = latest['MA60']
-            ma120 = latest['MA120']
+            # === 均线排列分析（使用公共模块）===
+            ma5 = _safe_ma(latest, 'MA5')
+            ma10 = _safe_ma(latest, 'MA10')
+            ma20 = _safe_ma(latest, 'MA20')
+            ma60 = _safe_ma(latest, 'MA60')
+            ma120 = _safe_ma(latest, 'MA120')
 
-            if any(np.isnan(x) for x in [ma5, ma10, ma20, ma60, ma120]):
+            if any(v is None for v in [ma5, ma10, ma20, ma60, ma120]):
                 return None
 
             # 均线多头排列检查
@@ -188,23 +183,10 @@ class TrendStockSelector:
             if dev_ma60 > 20:
                 return None
 
-            # === 趋势定义验证（高低点递增）===
-            recent_20 = df.tail(20)
-            recent_highs = []
-            recent_lows = []
-            for i in range(2, len(recent_20) - 2):
-                row = recent_20.iloc[i]
-                prev1 = recent_20.iloc[i - 1]
-                prev2 = recent_20.iloc[i - 2]
-                next1 = recent_20.iloc[i + 1]
-                next2 = recent_20.iloc[i + 2]
-                if row['最高'] >= prev1['最高'] and row['最高'] >= prev2['最高'] and row['最高'] >= next1['最高'] and row['最高'] >= next2['最高']:
-                    recent_highs.append(row['最高'])
-                if row['最低'] <= prev1['最低'] and row['最低'] <= prev2['最低'] and row['最低'] <= next1['最低'] and row['最低'] <= next2['最低']:
-                    recent_lows.append(row['最低'])
-
-            highs_rising = len(recent_highs) >= 2 and recent_highs[-1] > recent_highs[0]
-            lows_rising = len(recent_lows) >= 2 and recent_lows[-1] > recent_lows[0]
+            # === 趋势定义验证（使用公共模块）===
+            hl = detect_highs_lows(df)
+            highs_rising = hl['highs_rising']
+            lows_rising = hl['lows_rising']
 
             # === 趋势强度评分（0-10）===
             strength = 0
@@ -345,9 +327,9 @@ class TrendStockSelector:
             if result:
                 results.append(result)
 
-            # 控制请求频率
-            if (i + 1) % 5 == 0:
-                time.sleep(0.3)
+            # 控制请求频率（baostock 不限流，降低 sleep 频率）
+            if (i + 1) % 20 == 0:
+                time.sleep(0.2)
 
         if not results:
             print("\n⚠️ 未找到符合条件的股票")

@@ -10,7 +10,6 @@
   - 趋势方向(15分) + 钟摆位置(12.5分) + 趋势强度(10分) + 量价关系(7.5分) + 传统指标(5分)
 """
 
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -21,10 +20,14 @@ import sys
 
 warnings.filterwarnings('ignore')
 
-# 导入基本面分析模块和数据源适配层
+# 导入基本面分析模块、数据源适配层和公共技术指标
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fundamental_analyzer import FundamentalAnalyzer
 from data_source import DataSource
+from technical import (
+    calculate_all_indicators, detect_highs_lows,
+    analyze_ma_alignment, calculate_pendulum, calculate_trend_strength,
+)
 
 
 class SimpleStockAnalyzer:
@@ -123,54 +126,17 @@ class SimpleStockAnalyzer:
             pass
 
     def calculate_indicators(self):
-        """计算技术指标 — 以均线体系为核心"""
-        df = self.df
-
-        # === 核心：多级别均线 ===
-        df['MA5'] = df['收盘'].rolling(window=5).mean()
-        df['MA10'] = df['收盘'].rolling(window=10).mean()
-        df['MA20'] = df['收盘'].rolling(window=20).mean()
-        df['MA60'] = df['收盘'].rolling(window=60).mean()
-        if len(df) >= 120:
-            df['MA120'] = df['收盘'].rolling(window=120).mean()
-        if len(df) >= 250:
-            df['MA250'] = df['收盘'].rolling(window=250).mean()
-
-        # 均线斜率
-        for ma in ['MA5', 'MA10', 'MA20', 'MA60']:
-            df[f'{ma}_slope'] = (df[ma] - df[ma].shift(5)) / df[ma].shift(5) * 100
-
-        # 成交量
-        df['VOL_MA5'] = df['成交量'].rolling(window=5).mean()
-        df['VOL_MA20'] = df['成交量'].rolling(window=20).mean()
-
-        # === 可选参考：MACD(8,17,9) ===
-        exp1 = df['收盘'].ewm(span=8, adjust=False).mean()
-        exp2 = df['收盘'].ewm(span=17, adjust=False).mean()
-        df['DIF'] = exp1 - exp2
-        df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['MACD'] = 2 * (df['DIF'] - df['DEA'])
-
-        # === 可选参考：KDJ(6,3,3) ===
-        low_n = df['最低'].rolling(window=6).min()
-        high_n = df['最高'].rolling(window=6).max()
-        df['RSV'] = (df['收盘'] - low_n) / (high_n - low_n) * 100
-        df['K'] = df['RSV'].ewm(com=2, adjust=False).mean()
-        df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-        df['J'] = 3 * df['K'] - 2 * df['D']
-
-        # RSI
-        delta = df['收盘'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        """计算技术指标 — 使用公共模块"""
+        calculate_all_indicators(self.df)
 
         # 周线均线
         if self.df_weekly is not None and not self.df_weekly.empty:
-            self.df_weekly['W_MA5'] = self.df_weekly['收盘'].rolling(window=5).mean()
-            self.df_weekly['W_MA10'] = self.df_weekly['收盘'].rolling(window=10).mean()
-            self.df_weekly['W_MA20'] = self.df_weekly['收盘'].rolling(window=20).mean()
+            from technical import calculate_ma
+            calculate_ma(self.df_weekly, windows=[5, 10, 20])
+            # 重命名为 W_ 前缀以区分
+            for w in [5, 10, 20]:
+                if f'MA{w}' in self.df_weekly.columns:
+                    self.df_weekly[f'W_MA{w}'] = self.df_weekly[f'MA{w}']
 
     def analyze(self):
         """综合分析 — 以趋势+均线+钟摆为核心"""
@@ -224,29 +190,19 @@ class SimpleStockAnalyzer:
         else:
             trend_details.append('震荡缠绕')
 
-        # 高低点递增/递减
-        recent_20 = self.df.tail(20)
-        highs = []
-        lows = []
-        for i in range(2, len(recent_20) - 2):
-            row = recent_20.iloc[i]
-            if (row['最高'] >= recent_20.iloc[i-1]['最高'] and row['最高'] >= recent_20.iloc[i-2]['最高'] and
-                row['最高'] >= recent_20.iloc[i+1]['最高'] and row['最高'] >= recent_20.iloc[i+2]['最高']):
-                highs.append(row['最高'])
-            if (row['最低'] <= recent_20.iloc[i-1]['最低'] and row['最低'] <= recent_20.iloc[i-2]['最低'] and
-                row['最低'] <= recent_20.iloc[i+1]['最低'] and row['最低'] <= recent_20.iloc[i+2]['最低']):
-                lows.append(row['最低'])
+        # 高低点递增/递减（使用公共模块）
+        hl = detect_highs_lows(self.df)
 
-        if len(highs) >= 2 and highs[-1] > highs[0]:
+        if hl['highs_rising']:
             trend_buy += 1
             trend_details.append('高点递增')
-        if len(lows) >= 2 and lows[-1] > lows[0]:
+        if hl['lows_rising']:
             trend_buy += 1
             trend_details.append('低点递增')
-        if len(highs) >= 2 and highs[-1] < highs[0]:
+        if hl['highs_falling']:
             trend_sell += 1
             trend_details.append('高点递减')
-        if len(lows) >= 2 and lows[-1] < lows[0]:
+        if hl['lows_falling']:
             trend_sell += 1
             trend_details.append('低点递减')
 

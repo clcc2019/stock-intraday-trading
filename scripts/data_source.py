@@ -30,6 +30,7 @@ class DataSource:
     _logged_in = False
     _cache = {}  # 简单内存缓存
     _cache_ttl = 300  # 缓存5分钟
+    _cache_write_count = 0  # 写入计数，用于触发清理
     _akshare_available = None  # None=未检测, True=可用, False=不可用
     
     @classmethod
@@ -68,8 +69,23 @@ class DataSource:
     
     @classmethod
     def _set_cache(cls, key, data):
-        """设置缓存"""
+        """设置缓存，每100次写入清理一次过期条目"""
         cls._cache[key] = (data, time.time())
+        cls._cache_write_count += 1
+        if cls._cache_write_count >= 100:
+            cls._cleanup_cache()
+            cls._cache_write_count = 0
+
+    @classmethod
+    def _cleanup_cache(cls):
+        """清理所有过期缓存条目"""
+        now = time.time()
+        expired_keys = [
+            k for k, (_, ts) in cls._cache.items()
+            if now - ts >= cls._cache_ttl
+        ]
+        for k in expired_keys:
+            del cls._cache[k]
     
     @classmethod
     def _convert_code(cls, stock_code):
@@ -379,9 +395,10 @@ class DataSource:
         
         参数:
             index_code: 指数代码，如 'sh.000300'（沪深300）
+            支持: sh.000300(沪深300), sh.000905(中证500), sh.000016(上证50)
         
         返回:
-            DataFrame，包含 code（股票代码）、code_name（股票名称）
+            DataFrame，包含 代码（股票代码）、名称（股票名称）
         """
         cache_key = cls._get_cache_key('index_stocks', index_code)
         cached = cls._get_cache(cache_key)
@@ -390,12 +407,23 @@ class DataSource:
         
         cls.login()
         
-        rs = bs.query_hs300_stocks(date=datetime.now().strftime('%Y-%m-%d'))
+        # 根据指数代码选择正确的 baostock API
+        api_map = {
+            'sh.000300': bs.query_hs300_stocks,
+            'sh.000905': bs.query_zz500_stocks,
+            'sh.000016': bs.query_sz50_stocks,
+        }
+        query_fn = api_map.get(index_code)
+        if query_fn is None:
+            raise Exception(f"不支持的指数: {index_code}，支持: sh.000300(沪深300), sh.000905(中证500), sh.000016(上证50)")
+        
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        rs = query_fn(date=date_str)
         
         if rs.error_code != '0':
-            # 如果失败，尝试历史日期
+            # 如果失败，尝试前一个交易日
             yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-            rs = bs.query_hs300_stocks(date=yesterday)
+            rs = query_fn(date=yesterday)
         
         if rs.error_code != '0':
             raise Exception(f"获取指数成分股失败: {rs.error_msg}")

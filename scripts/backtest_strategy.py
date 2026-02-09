@@ -12,15 +12,19 @@ MACD/KDJ 策略历史回测系统
   python3 backtest_strategy.py 600519 002594 600276 # 多只自定义股票
 """
 
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
-import time
 import sys
+import os
 
 warnings.filterwarnings('ignore')
+
+# 导入统一数据源和公共技术指标
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_source import DataSource
+from technical import calculate_ma, calculate_macd, calculate_kdj, calculate_rsi, calculate_volume_ma
 
 # ============================================================
 # 常量
@@ -48,113 +52,35 @@ PRESET_STOCKS = {
 # ============================================================
 
 def fetch_stock_data(stock_code, days=BACKTEST_DAYS):
-    """获取历史日K线数据（自动选择可用数据源）"""
+    """获取历史日K线数据（使用统一 DataSource）"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
-
-    # 方法1: 优先使用东方财富 stock_zh_a_hist
-    for attempt in range(2):
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date.strftime('%Y%m%d'),
-                end_date=end_date.strftime('%Y%m%d'),
-                adjust="qfq"
-            )
-            if df is not None and not df.empty:
-                return df
-            time.sleep(1)
-        except Exception as e:
-            if attempt == 1:
-                print(f"   ⚠ 东方财富数据源不可用，切换备用数据源...")
-            time.sleep(1)
-
-    # 方法2: 备用数据源 stock_zh_a_daily（网易财经）
-    try:
-        # stock_zh_a_daily 需要 sh/sz 前缀
-        if stock_code.startswith('6'):
-            symbol = f'sh{stock_code}'
-        elif stock_code.startswith(('0', '3')):
-            symbol = f'sz{stock_code}'
-        else:
-            symbol = f'sh{stock_code}'
-
-        df = ak.stock_zh_a_daily(
-            symbol=symbol,
-            start_date=start_date.strftime('%Y%m%d'),
-            end_date=end_date.strftime('%Y%m%d'),
-            adjust="qfq"
-        )
-        if df is not None and not df.empty:
-            # 统一列名为中文（与 stock_zh_a_hist 保持一致）
-            col_map = {
-                'date': '日期', 'open': '开盘', 'high': '最高',
-                'low': '最低', 'close': '收盘', 'volume': '成交量',
-                'amount': '成交额', 'turnover': '换手率',
-                'outstanding_share': '流通股本',
-            }
-            df = df.rename(columns=col_map)
-            # 确保日期列为字符串格式
-            if '日期' in df.columns:
-                df['日期'] = df['日期'].astype(str)
-            df = df.reset_index(drop=True)
-            print(f"   ✓ 使用备用数据源获取成功")
-            return df
-    except Exception as e:
-        print(f"   ✗ 备用数据源也失败: {e}")
-
-    return None
+    df = DataSource.get_stock_hist(
+        stock_code=stock_code,
+        start_date=start_date,
+        end_date=end_date,
+        adjust='qfq',
+        period='daily'
+    )
+    return df if df is not None and not df.empty else None
 
 
 def get_stock_name(stock_code):
     """尝试获取股票名称"""
     if stock_code in PRESET_STOCKS:
         return PRESET_STOCKS[stock_code]
-    try:
-        info = ak.stock_individual_info_em(symbol=stock_code)
-        if info is not None and not info.empty:
-            row = info[info['item'] == '股票简称']
-            if not row.empty:
-                return row['value'].values[0]
-    except Exception:
-        pass
     return stock_code
 
 
 def calculate_indicators(df):
-    """计算全部技术指标（与 analyze_stock_simple.py 保持一致）"""
-    # MACD (8, 17, 9)
-    exp1 = df['收盘'].ewm(span=8, adjust=False).mean()
-    exp2 = df['收盘'].ewm(span=17, adjust=False).mean()
-    df['DIF'] = exp1 - exp2
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = 2 * (df['DIF'] - df['DEA'])
+    """计算全部技术指标（使用公共模块）"""
+    calculate_ma(df, windows=[5, 10, 20])
+    calculate_macd(df)
+    calculate_kdj(df)
+    calculate_rsi(df)
+    calculate_volume_ma(df, windows=[5])
 
-    # KDJ (6, 3, 3)
-    low_n = df['最低'].rolling(window=6).min()
-    high_n = df['最高'].rolling(window=6).max()
-    df['RSV'] = (df['收盘'] - low_n) / (high_n - low_n) * 100
-    df['K'] = df['RSV'].ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-    df['J'] = 3 * df['K'] - 2 * df['D']
-
-    # RSI (14)
-    delta = df['收盘'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # MA
-    df['MA5'] = df['收盘'].rolling(window=5).mean()
-    df['MA10'] = df['收盘'].rolling(window=10).mean()
-    df['MA20'] = df['收盘'].rolling(window=20).mean()
-
-    # Volume MA
-    df['VOL_MA5'] = df['成交量'].rolling(window=5).mean()
-
-    # MACD 背离（逐日滚动检测）
+    # MACD 背离（逐日滚动检测，回测专用）
     df['MACD_divergence'] = 'none'
     for idx in range(30, len(df)):
         window = df.iloc[idx - 30:idx + 1].copy()

@@ -12,14 +12,12 @@
   chart/stock_data.json — K线、均线、MACD、KDJ、买卖信号等全量数据
 """
 
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import json
 import sys
 import os
-import time
 import warnings
 import argparse
 import webbrowser
@@ -28,132 +26,46 @@ import threading
 
 warnings.filterwarnings('ignore')
 
-# ============================================================
-# 数据源（与其他脚本一致的双数据源策略）
-# ============================================================
-_eastmoney_available = None
+# 导入统一数据源和公共技术指标
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_source import DataSource
+from technical import calculate_all_indicators
+
+
+STOCK_NAME_PRESET = {
+    '600519': '贵州茅台', '002594': '比亚迪', '600276': '恒瑞医药',
+    '300750': '宁德时代', '000858': '五粮液', '601318': '中国平安',
+    '600036': '招商银行', '000333': '美的集团', '600900': '长江电力',
+    '601012': '隆基绿能', '002475': '立讯精密', '300059': '东方财富',
+    '600893': '航发动力', '600482': '中国动力', '002028': '思源电气',
+    '002415': '海康威视', '600406': '国电南瑞', '601872': '招商轮船',
+}
 
 
 def fetch_daily_data(stock_code, days=400):
-    """获取日线数据（自动选择可用数据源）"""
-    global _eastmoney_available
+    """获取日线数据（使用统一 DataSource）"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
-
-    # 东方财富
-    if _eastmoney_available is not False:
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=stock_code, period="daily",
-                start_date=start_date.strftime('%Y%m%d'),
-                end_date=end_date.strftime('%Y%m%d'),
-                adjust="qfq"
-            )
-            if df is not None and not df.empty:
-                _eastmoney_available = True
-                return df
-        except Exception:
-            if _eastmoney_available is None:
-                print("   ⚠ 东方财富数据源不可用，切换备用数据源...")
-            _eastmoney_available = False
-
-    # 网易财经备用
-    try:
-        if stock_code.startswith('6'):
-            symbol = f'sh{stock_code}'
-        elif stock_code.startswith(('0', '3')):
-            symbol = f'sz{stock_code}'
-        else:
-            symbol = f'sh{stock_code}'
-        df = ak.stock_zh_a_daily(
-            symbol=symbol,
-            start_date=start_date.strftime('%Y%m%d'),
-            end_date=end_date.strftime('%Y%m%d'),
-            adjust="qfq"
-        )
-        if df is not None and not df.empty:
-            col_map = {
-                'date': '日期', 'open': '开盘', 'high': '最高',
-                'low': '最低', 'close': '收盘', 'volume': '成交量',
-                'amount': '成交额', 'turnover': '换手率',
-            }
-            df = df.rename(columns=col_map)
-            if '日期' in df.columns:
-                df['日期'] = df['日期'].astype(str)
-            df = df.reset_index(drop=True)
-            return df
-    except Exception:
-        pass
-    return None
+    df = DataSource.get_stock_hist(
+        stock_code=stock_code,
+        start_date=start_date,
+        end_date=end_date,
+        adjust='qfq',
+        period='daily'
+    )
+    return df if df is not None and not df.empty else None
 
 
 def get_stock_name(stock_code):
     """获取股票名称"""
-    preset = {
-        '600519': '贵州茅台', '002594': '比亚迪', '600276': '恒瑞医药',
-        '300750': '宁德时代', '000858': '五粮液', '601318': '中国平安',
-        '600036': '招商银行', '000333': '美的集团', '600900': '长江电力',
-        '601012': '隆基绿能', '002475': '立讯精密', '300059': '东方财富',
-        '600893': '航发动力', '600482': '中国动力', '002028': '思源电气',
-        '002415': '海康威视', '600406': '国电南瑞', '601872': '招商轮船',
-    }
-    if stock_code in preset:
-        return preset[stock_code]
-    try:
-        info = ak.stock_individual_info_em(symbol=stock_code)
-        if info is not None and not info.empty:
-            row = info[info['item'] == '股票简称']
-            if not row.empty:
-                return row['value'].values[0]
-    except Exception:
-        pass
+    if stock_code in STOCK_NAME_PRESET:
+        return STOCK_NAME_PRESET[stock_code]
     return f'股票{stock_code}'
 
 
-# ============================================================
-# 技术指标计算
-# ============================================================
 def calc_indicators(df):
-    """计算全部技术指标"""
-    # 均线
-    for n in [5, 10, 20, 60]:
-        df[f'MA{n}'] = df['收盘'].rolling(window=n).mean()
-    if len(df) >= 120:
-        df['MA120'] = df['收盘'].rolling(window=120).mean()
-    if len(df) >= 250:
-        df['MA250'] = df['收盘'].rolling(window=250).mean()
-
-    # 均线斜率
-    for ma in ['MA5', 'MA10', 'MA20', 'MA60']:
-        df[f'{ma}_slope'] = (df[ma] - df[ma].shift(5)) / df[ma].shift(5) * 100
-
-    # MACD (8, 17, 9)
-    exp1 = df['收盘'].ewm(span=8, adjust=False).mean()
-    exp2 = df['收盘'].ewm(span=17, adjust=False).mean()
-    df['DIF'] = exp1 - exp2
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = 2 * (df['DIF'] - df['DEA'])
-
-    # KDJ (6, 3, 3)
-    low_n = df['最低'].rolling(window=6).min()
-    high_n = df['最高'].rolling(window=6).max()
-    rsv = (df['收盘'] - low_n) / (high_n - low_n) * 100
-    df['K'] = rsv.ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-    df['J'] = 3 * df['K'] - 2 * df['D']
-
-    # RSI (14)
-    delta = df['收盘'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # 成交量均线
-    df['VOL_MA5'] = df['成交量'].rolling(window=5).mean()
-    df['VOL_MA20'] = df['成交量'].rolling(window=20).mean()
-
-    return df
+    """计算全部技术指标（使用公共模块）"""
+    return calculate_all_indicators(df)
 
 
 # ============================================================

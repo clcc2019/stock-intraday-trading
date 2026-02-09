@@ -19,9 +19,13 @@ import sys
 
 warnings.filterwarnings('ignore')
 
-# 导入数据源适配层
+# 导入数据源适配层和公共技术指标
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_source import DataSource
+from technical import (
+    calculate_ma, calculate_macd, calculate_kdj, calculate_volume_ma,
+    detect_highs_lows, analyze_ma_alignment, calculate_pendulum, _safe_ma,
+)
 
 
 class IntradayT0Analyzer:
@@ -142,50 +146,23 @@ class IntradayT0Analyzer:
             pass
 
     def calculate_indicators(self):
-        """计算技术指标 — 以均线体系为核心"""
+        """计算技术指标 — 使用公共模块"""
         df = self.df_daily
 
-        # === 核心：多级别均线 ===
-        df['MA5'] = df['收盘'].rolling(window=5).mean()
-        df['MA10'] = df['收盘'].rolling(window=10).mean()
-        df['MA20'] = df['收盘'].rolling(window=20).mean()
-        df['MA60'] = df['收盘'].rolling(window=60).mean()
-        if len(df) >= 120:
-            df['MA120'] = df['收盘'].rolling(window=120).mean()
-        if len(df) >= 250:
-            df['MA250'] = df['收盘'].rolling(window=250).mean()
+        # 日线指标（均线、MACD、KDJ、成交量均线）
+        calculate_ma(df)
+        calculate_macd(df)
+        calculate_kdj(df)
+        calculate_volume_ma(df)
 
-        # 均线斜率（5日变化率）
-        for ma_name in ['MA5', 'MA10', 'MA20', 'MA60']:
-            if ma_name in df.columns:
-                df[f'{ma_name}_slope'] = (df[ma_name] - df[ma_name].shift(5)) / df[ma_name].shift(5) * 100
-
-        # 成交量均线
-        df['VOL_MA5'] = df['成交量'].rolling(window=5).mean()
-        df['VOL_MA20'] = df['成交量'].rolling(window=20).mean()
-
-        # === 周线均线（如有周K线数据）===
+        # 周线均线
         if self.df_weekly is not None and not self.df_weekly.empty:
-            self.df_weekly['W_MA5'] = self.df_weekly['收盘'].rolling(window=5).mean()
-            self.df_weekly['W_MA10'] = self.df_weekly['收盘'].rolling(window=10).mean()
-            self.df_weekly['W_MA20'] = self.df_weekly['收盘'].rolling(window=20).mean()
+            calculate_ma(self.df_weekly, windows=[5, 10, 20])
+            for w in [5, 10, 20]:
+                if f'MA{w}' in self.df_weekly.columns:
+                    self.df_weekly[f'W_MA{w}'] = self.df_weekly[f'MA{w}']
 
-        # === 可选参考：MACD(8,17,9) ===
-        exp1_d = df['收盘'].ewm(span=8, adjust=False).mean()
-        exp2_d = df['收盘'].ewm(span=17, adjust=False).mean()
-        df['DIF'] = exp1_d - exp2_d
-        df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-        df['MACD'] = 2 * (df['DIF'] - df['DEA'])
-
-        # === 可选参考：KDJ(6,3,3) ===
-        low_n_d = df['最低'].rolling(window=6).min()
-        high_n_d = df['最高'].rolling(window=6).max()
-        df['RSV'] = (df['收盘'] - low_n_d) / (high_n_d - low_n_d) * 100
-        df['K'] = df['RSV'].ewm(com=2, adjust=False).mean()
-        df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-        df['J'] = 3 * df['K'] - 2 * df['D']
-
-        # === 分时指标 ===
+        # 分时指标
         if self.df_minute is not None and not self.df_minute.empty and len(self.df_minute) >= 5:
             # 分时均价线（VWAP）— 做T的核心参考线
             self.df_minute['VWAP'] = (self.df_minute['成交额'].cumsum() / self.df_minute['成交量'].cumsum())
@@ -199,45 +176,17 @@ class IntradayT0Analyzer:
         price = self.data['current_price']
         result = {}
 
-        # === 日线趋势分析 ===
-        ma5 = latest['MA5']
-        ma10 = latest['MA10']
-        ma20 = latest['MA20']
-        ma60 = latest['MA60'] if 'MA60' in latest and not np.isnan(latest.get('MA60', np.nan)) else None
-        ma120 = latest.get('MA120', np.nan)
-        ma120 = ma120 if not np.isnan(ma120) else None
-        ma250 = latest.get('MA250', np.nan)
-        ma250 = ma250 if not np.isnan(ma250) else None
-
-        # 均线排列判断
-        if ma60 and not np.isnan(ma5) and not np.isnan(ma10) and not np.isnan(ma20):
-            if ma5 > ma10 > ma20 > ma60:
-                if ma120 and price > ma120:
-                    ma_alignment = '完美多头(MA5>10>20>60, 价格>MA120)'
-                else:
-                    ma_alignment = '强势多头(MA5>10>20>60)'
-                alignment_score = 3
-            elif ma5 > ma10 > ma20:
-                ma_alignment = '多头(MA5>10>20)'
-                alignment_score = 2
-            elif ma5 > ma10:
-                ma_alignment = '偏多(MA5>10)'
-                alignment_score = 1
-            elif ma5 < ma10 < ma20:
-                if ma60 and ma20 < ma60:
-                    ma_alignment = '空头(MA5<10<20<60)'
-                else:
-                    ma_alignment = '偏空(MA5<10<20)'
-                alignment_score = -2
-            elif ma5 < ma10:
-                ma_alignment = '偏空(MA5<10)'
-                alignment_score = -1
-            else:
-                ma_alignment = '震荡缠绕'
-                alignment_score = 0
-        else:
-            ma_alignment = '数据不足'
-            alignment_score = 0
+        # === 日线趋势分析（使用公共模块）===
+        alignment_info = analyze_ma_alignment(latest, price)
+        ma_alignment = alignment_info['desc']
+        alignment_score = alignment_info['score']
+        ma_vals = alignment_info['ma_values']
+        ma5 = ma_vals['MA5']
+        ma10 = ma_vals['MA10']
+        ma20 = ma_vals['MA20']
+        ma60 = ma_vals['MA60']
+        ma120 = ma_vals['MA120']
+        ma250 = ma_vals['MA250']
 
         # 均线方向（斜率）
         ma20_slope = latest.get('MA20_slope', 0)
@@ -256,27 +205,12 @@ class IntradayT0Analyzer:
         else:
             ma20_dir = '↓ 下行'
 
-        # 趋势定义（高低点递增/递减）
-        recent_20 = self.df_daily.tail(20)
-        highs = []
-        lows = []
-        for i in range(2, len(recent_20) - 2):
-            row = recent_20.iloc[i]
-            if (row['最高'] >= recent_20.iloc[i-1]['最高'] and
-                row['最高'] >= recent_20.iloc[i-2]['最高'] and
-                row['最高'] >= recent_20.iloc[i+1]['最高'] and
-                row['最高'] >= recent_20.iloc[i+2]['最高']):
-                highs.append(row['最高'])
-            if (row['最低'] <= recent_20.iloc[i-1]['最低'] and
-                row['最低'] <= recent_20.iloc[i-2]['最低'] and
-                row['最低'] <= recent_20.iloc[i+1]['最低'] and
-                row['最低'] <= recent_20.iloc[i+2]['最低']):
-                lows.append(row['最低'])
-
-        highs_rising = len(highs) >= 2 and highs[-1] > highs[0]
-        lows_rising = len(lows) >= 2 and lows[-1] > lows[0]
-        highs_falling = len(highs) >= 2 and highs[-1] < highs[0]
-        lows_falling = len(lows) >= 2 and lows[-1] < lows[0]
+        # 趋势定义（高低点递增/递减，使用公共模块）
+        hl = detect_highs_lows(self.df_daily)
+        highs_rising = hl['highs_rising']
+        lows_rising = hl['lows_rising']
+        highs_falling = hl['highs_falling']
+        lows_falling = hl['lows_falling']
 
         if highs_rising and lows_rising:
             trend_def = '标准上升趋势'
@@ -375,54 +309,16 @@ class IntradayT0Analyzer:
         return result
 
     def analyze_pendulum_position(self):
-        """钟摆位置分析（均线偏离度）"""
+        """钟摆位置分析（使用公共模块）"""
         price = self.data['current_price']
         latest = self.df_daily.iloc[-1]
-        result = {}
-
-        for ma_name, ma_val in [('MA20', latest['MA20']),
-                                 ('MA60', latest.get('MA60', np.nan)),
-                                 ('MA120', latest.get('MA120', np.nan)),
-                                 ('MA250', latest.get('MA250', np.nan))]:
-            if isinstance(ma_val, float) and np.isnan(ma_val):
-                result[ma_name] = {'value': None, 'deviation': None, 'phase': '数据不足'}
-                continue
-
-            dev = (price - ma_val) / ma_val * 100
-
-            if dev > 15:
-                phase = '极度偏高（绳子极紧，回归压力大）'
-            elif dev > 10:
-                phase = '偏高（注意回归压力）'
-            elif dev > 5:
-                phase = '略高'
-            elif dev > -2:
-                phase = '中枢附近（适合做T）'
-            elif dev > -5:
-                phase = '略低'
-            elif dev > -10:
-                phase = '偏低（回归动力增强）'
-            else:
-                phase = '极度偏低（绳子极紧，反弹动力大）'
-
-            result[ma_name] = {'value': ma_val, 'deviation': dev, 'phase': phase}
-
-        # 综合钟摆阶段
-        dev_ma20 = result['MA20']['deviation']
-        if dev_ma20 is not None:
-            if abs(dev_ma20) <= 3:
-                overall = '钟摆在中枢附近，适合做T'
-            elif dev_ma20 > 5:
-                overall = '钟摆偏高，做T以卖出为主'
-            elif dev_ma20 < -5:
-                overall = '钟摆偏低，做T以买入为主'
-            else:
-                overall = '钟摆在中间区域'
-        else:
-            overall = '数据不足'
-
-        result['overall'] = overall
-        return result
+        ma_values = {
+            'MA20': _safe_ma(latest, 'MA20'),
+            'MA60': _safe_ma(latest, 'MA60'),
+            'MA120': _safe_ma(latest, 'MA120'),
+            'MA250': _safe_ma(latest, 'MA250'),
+        }
+        return calculate_pendulum(price, ma_values)
 
     def analyze_intraday_t0(self):
         """日内T+0策略分析 — 以「顺大势逆小势」为核心"""
