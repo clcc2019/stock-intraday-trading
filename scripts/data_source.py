@@ -21,13 +21,8 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import hashlib
-import os
 
 warnings.filterwarnings('ignore')
-
-# 磁盘缓存目录
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache')
-os.makedirs(_CACHE_DIR, exist_ok=True)
 
 # 延迟导入 adata（可选依赖）
 _adata = None
@@ -112,24 +107,6 @@ class DataSource:
         ]
         for k in expired_keys:
             del cls._cache[k]
-
-    @classmethod
-    def clear_disk_cache(cls, stock_code=None):
-        """清理磁盘缓存
-        
-        参数:
-            stock_code: 指定股票代码，为 None 清理全部
-        """
-        if stock_code:
-            import glob
-            pattern = os.path.join(_CACHE_DIR, f'{stock_code}_*.csv')
-            for f in glob.glob(pattern):
-                os.remove(f)
-        else:
-            import shutil
-            if os.path.exists(_CACHE_DIR):
-                shutil.rmtree(_CACHE_DIR)
-                os.makedirs(_CACHE_DIR, exist_ok=True)
     
     @classmethod
     def _convert_code(cls, stock_code):
@@ -233,82 +210,10 @@ class DataSource:
         cls._set_cache(cache_key, result)
         return result
     
-    # ============================================================
-    # 磁盘缓存：智能增量更新历史K线
-    # ============================================================
-
-    @classmethod
-    def _disk_cache_path(cls, stock_code, adjust, period):
-        """生成磁盘缓存文件路径"""
-        return os.path.join(_CACHE_DIR, f'{stock_code}_{period}_{adjust}.csv')
-
-    _disk_update_times = {}  # {cache_path: last_update_timestamp}
-    _DISK_UPDATE_COOLDOWN = 900  # 15分钟增量冷却期
-
-    @classmethod
-    def _load_disk_cache(cls, stock_code, adjust, period):
-        """从磁盘读取缓存"""
-        path = cls._disk_cache_path(stock_code, adjust, period)
-        if not os.path.exists(path):
-            return None
-        try:
-            df = pd.read_csv(path, dtype={'日期': str})
-            if df.empty or '日期' not in df.columns:
-                return None
-            # 类型转换
-            for col in ['开盘', '最高', '最低', '收盘', '换手率', '涨跌幅']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            if '成交量' in df.columns:
-                df['成交量'] = pd.to_numeric(df['成交量'], errors='coerce').fillna(0).astype(np.int64)
-            if '成交额' in df.columns:
-                df['成交额'] = pd.to_numeric(df['成交额'], errors='coerce').fillna(0).astype(np.float64)
-            return df
-        except Exception:
-            return None
-
-    @classmethod
-    def _should_try_increment(cls, stock_code, adjust, period):
-        """检查是否应该尝试增量更新（冷却期内跳过联网）"""
-        path = cls._disk_cache_path(stock_code, adjust, period)
-        last_update = cls._disk_update_times.get(path)
-        if last_update is None:
-            # 首次：用文件修改时间判断
-            if os.path.exists(path):
-                mtime = os.path.getmtime(path)
-                if time.time() - mtime < cls._DISK_UPDATE_COOLDOWN:
-                    return False
-        else:
-            if time.time() - last_update < cls._DISK_UPDATE_COOLDOWN:
-                return False
-        return True
-
-    @classmethod
-    def _mark_disk_updated(cls, stock_code, adjust, period):
-        """标记磁盘缓存已更新"""
-        path = cls._disk_cache_path(stock_code, adjust, period)
-        cls._disk_update_times[path] = time.time()
-
-    @classmethod
-    def _save_disk_cache(cls, df, stock_code, adjust, period):
-        """保存到磁盘缓存"""
-        if df is None or df.empty:
-            return
-        path = cls._disk_cache_path(stock_code, adjust, period)
-        try:
-            df.to_csv(path, index=False)
-        except Exception:
-            pass
-
     @classmethod
     def get_stock_hist(cls, stock_code, start_date=None, end_date=None, adjust='qfq', period='daily'):
         """
-        获取股票历史K线数据（磁盘缓存 + 智能增量更新）
-        
-        性能优化：
-        1. 首先检查内存缓存（5分钟TTL）
-        2. 再检查磁盘缓存，如有则只查询缺失的增量数据
-        3. 无缓存才全量查询
+        获取股票历史K线数据（带缓存和多数据源切换）
         
         参数:
             stock_code: 6位股票代码，如 '600519'
@@ -320,102 +225,20 @@ class DataSource:
         返回:
             DataFrame，列名与 akshare 兼容：日期、开盘、最高、最低、收盘、成交量、成交额、换手率
         """
-        # 1. 检查内存缓存
+        # 检查缓存
         cache_key = cls._get_cache_key('hist', stock_code, start_date, end_date, adjust, period)
         cached = cls._get_cache(cache_key)
         if cached is not None:
             return cached.copy()
         
-        # 标准化日期
-        if isinstance(end_date, datetime):
-            end_str = end_date.strftime('%Y-%m-%d')
-        elif end_date and len(str(end_date)) == 8:
-            end_str = f'{str(end_date)[:4]}-{str(end_date)[4:6]}-{str(end_date)[6:]}'
-        elif end_date:
-            end_str = str(end_date)
-        else:
-            end_str = datetime.now().strftime('%Y-%m-%d')
-
-        if isinstance(start_date, datetime):
-            start_str = start_date.strftime('%Y-%m-%d')
-        elif start_date and len(str(start_date)) == 8:
-            start_str = f'{str(start_date)[:4]}-{str(start_date)[4:6]}-{str(start_date)[6:]}'
-        elif start_date:
-            start_str = str(start_date)
-        else:
-            start_str = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
-
-        # 2. 磁盘缓存 + 智能增量更新（仅日线/周线）
-        if period in ('daily', 'weekly'):
-            disk_df = cls._load_disk_cache(stock_code, adjust, period)
-            if disk_df is not None and len(disk_df) > 0:
-                last_cached_date = str(disk_df['日期'].iloc[-1])
-                # 如果缓存已经覆盖到今天或昨天，直接用缓存
-                today_str = datetime.now().strftime('%Y-%m-%d')
-                yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-                if last_cached_date >= yesterday_str:
-                    # 缓存足够新，检查冷却期再决定是否增量
-                    if cls._should_try_increment(stock_code, adjust, period):
-                        incr_start = (datetime.strptime(last_cached_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-                        if incr_start <= today_str:
-                            try:
-                                incr_df = cls._fetch_from_source(stock_code, incr_start, end_str, adjust, period)
-                                if incr_df is not None and not incr_df.empty:
-                                    disk_df = pd.concat([disk_df, incr_df], ignore_index=True)
-                                    disk_df = disk_df.drop_duplicates(subset=['日期'], keep='last').sort_values('日期').reset_index(drop=True)
-                                    cls._save_disk_cache(disk_df, stock_code, adjust, period)
-                            except Exception:
-                                pass  # 增量失败用现有缓存
-                        cls._mark_disk_updated(stock_code, adjust, period)
-                    # 按请求日期范围过滤
-                    result = disk_df[(disk_df['日期'] >= start_str) & (disk_df['日期'] <= end_str)].reset_index(drop=True)
-                    if not result.empty:
-                        cls._set_cache(cache_key, result)
-                        return result.copy()
-                elif last_cached_date >= start_str:
-                    # 缓存部分覆盖，追加后面缺失的部分
-                    incr_start = (datetime.strptime(last_cached_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-                    try:
-                        incr_df = cls._fetch_from_source(stock_code, incr_start, end_str, adjust, period)
-                        if incr_df is not None and not incr_df.empty:
-                            disk_df = pd.concat([disk_df, incr_df], ignore_index=True)
-                            disk_df = disk_df.drop_duplicates(subset=['日期'], keep='last').sort_values('日期').reset_index(drop=True)
-                            cls._save_disk_cache(disk_df, stock_code, adjust, period)
-                            cls._mark_disk_updated(stock_code, adjust, period)
-                            result = disk_df[(disk_df['日期'] >= start_str) & (disk_df['日期'] <= end_str)].reset_index(drop=True)
-                            if not result.empty:
-                                cls._set_cache(cache_key, result)
-                                return result.copy()
-                    except Exception:
-                        pass
-
-        # 3. 全量获取（无缓存或缓存失效）
-        df = cls._fetch_from_source(stock_code, start_str, end_str, adjust, period)
-        if df is not None and not df.empty:
-            cls._set_cache(cache_key, df)
-            if period in ('daily', 'weekly'):
-                # 合并保存（保留更多历史数据）
-                disk_df = cls._load_disk_cache(stock_code, adjust, period)
-                if disk_df is not None and not disk_df.empty:
-                    merged = pd.concat([disk_df, df], ignore_index=True)
-                    merged = merged.drop_duplicates(subset=['日期'], keep='last').sort_values('日期').reset_index(drop=True)
-                    cls._save_disk_cache(merged, stock_code, adjust, period)
-                else:
-                    cls._save_disk_cache(df, stock_code, adjust, period)
-            return df
-        
-        return pd.DataFrame()
-
-    @classmethod
-    def _fetch_from_source(cls, stock_code, start_date, end_date, adjust, period):
-        """从数据源获取数据（baostock 主 → akshare 备）"""
         # 尝试 baostock（主数据源）
         try:
             df = cls._get_stock_hist_baostock(stock_code, start_date, end_date, adjust, period)
             if df is not None and not df.empty:
+                cls._set_cache(cache_key, df)
                 return df
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"   ⚠ baostock 获取失败，尝试备用数据源...")
         
         # 降级到 akshare（备用数据源）
         if cls._akshare_available is not False:
@@ -424,9 +247,11 @@ class DataSource:
                 df = cls._get_stock_hist_akshare(ak, stock_code, start_date, end_date, adjust, period)
                 if df is not None and not df.empty:
                     cls._akshare_available = True
+                    cls._set_cache(cache_key, df)
                     return df
-            except Exception:
+            except Exception as e:
                 cls._akshare_available = False
+                print(f"   ⚠ akshare 备用数据源也失败")
         
         return pd.DataFrame()
     
