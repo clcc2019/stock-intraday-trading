@@ -223,31 +223,32 @@ class TrendStockSelector:
             elif change_20d > 0:
                 strength += 1
 
-            # === 钟摆位置评估 ===
+            # === 钟摆位置评估（更严格的分级）===
             if dev_ma20 <= 2:
                 pendulum = '回踩MA20附近'
-                pendulum_score = 3  # 最佳做T位置
-            elif dev_ma20 <= 5:
+                pendulum_score = 4  # 最佳做T位置
+            elif dev_ma20 <= 4:
                 pendulum = '略高于MA20'
+                pendulum_score = 3
+            elif dev_ma20 <= 6:
+                pendulum = '偏高'
                 pendulum_score = 2
             elif dev_ma20 <= 10:
-                pendulum = '偏高'
+                pendulum = '明显偏高'
                 pendulum_score = 1
             else:
                 pendulum = '过度偏高'
                 pendulum_score = 0
 
-            # === 做T适合度 ===
-            # 趋势向上 + 钟摆回摆至均线附近 = 最佳做T候选
-            t0_score = min(3, pendulum_score)
-            if strength >= 7:
-                t0_label = '⭐⭐⭐'
+            # === 做T适合度（钟摆位置是关键因素）===
+            if strength >= 6 and pendulum_score >= 3:
+                t0_label = '⭐⭐⭐'  # 趋势强+回踩到位
             elif strength >= 5 and pendulum_score >= 2:
-                t0_label = '⭐⭐'
-            elif strength >= 4:
-                t0_label = '⭐'
+                t0_label = '⭐⭐'    # 趋势好+位置尚可
+            elif strength >= 4 and pendulum_score >= 2:
+                t0_label = '⭐'      # 基本可做
             else:
-                t0_label = '-'
+                t0_label = '-'       # 不适合（偏高或趋势弱）
 
             # === 均线排列描述 ===
             if perfect_bull and price > ma120:
@@ -263,6 +264,7 @@ class TrendStockSelector:
                 'code': stock_code,
                 'name': name,
                 'price': price,
+                '_ma20': ma20,  # 保存MA20值，用于实时偏离度计算
                 'strength': strength,
                 'ma_desc': ma_desc,
                 'dev_ma20': dev_ma20,
@@ -289,15 +291,53 @@ class TrendStockSelector:
                     light = fa.get_light_score()
                     result['fund_score'] = light['score']
                     result['fund_max'] = light['max_score']
-                    # 综合得分 = 技术面强度(0-10) * 0.5 + 基本面(0-10) * 0.5
-                    result['combined_score'] = round(strength * 0.5 + light['score'] * 0.5, 1)
+                    # 综合得分 = 技术面强度(0-10)*0.4 + 基本面(0-10)*0.4 + 钟摆位置(0-4→0-10)*0.2
+                    pendulum_norm = min(10, pendulum_score * 2.5)  # 归一化到 0-10
+                    result['combined_score'] = round(strength * 0.4 + light['score'] * 0.4 + pendulum_norm * 0.2, 1)
                 except Exception:
-                    result['combined_score'] = strength * 0.5  # 基本面失败按0分
+                    pendulum_norm = min(10, pendulum_score * 2.5)
+                    result['combined_score'] = round(strength * 0.4 + pendulum_norm * 0.2, 1)  # 基本面失败按0分
 
             return result
 
         except Exception:
             return None
+
+    def _enrich_with_realtime(self, results):
+        """用 adata 实时行情补充最新价格（交易日盘中有效）"""
+        codes = [r['code'] for r in results]
+        try:
+            rt = DataSource.get_realtime_quote(codes)
+            if rt is None or rt.empty:
+                return False
+            # 构建 code -> row 映射
+            rt_map = {}
+            code_col = 'stock_code' if 'stock_code' in rt.columns else ('code' if 'code' in rt.columns else None)
+            if code_col is None:
+                return False
+            for _, row in rt.iterrows():
+                rt_map[str(row[code_col])] = row
+
+            updated = 0
+            for r in results:
+                row = rt_map.get(r['code'])
+                if row is None:
+                    continue
+                # 获取实时价格
+                price_col = 'price' if 'price' in row.index else ('trade_price' if 'trade_price' in row.index else None)
+                if price_col and pd.notna(row[price_col]) and float(row[price_col]) > 0:
+                    rt_price = float(row[price_col])
+                    r['rt_price'] = rt_price
+                    # 用实时价格重新计算偏离度
+                    r['rt_dev_ma20'] = (rt_price - r.get('_ma20', r['price'])) / r.get('_ma20', r['price']) * 100 if r.get('_ma20', 0) > 0 else r['dev_ma20']
+                    # 涨跌幅
+                    chg_col = 'change_pct' if 'change_pct' in row.index else ('pct_chg' if 'pct_chg' in row.index else None)
+                    if chg_col and pd.notna(row[chg_col]):
+                        r['rt_change'] = float(row[chg_col])
+                    updated += 1
+            return updated > 0
+        except Exception:
+            return False
 
     def run(self):
         """执行选股"""
@@ -336,34 +376,49 @@ class TrendStockSelector:
             print("   建议：放宽筛选范围或更换股票池")
             return
 
-        # 按综合得分排序（技术面*0.5 + 基本面*0.5）
+        # 尝试用实时行情补充最新价格
+        has_realtime = self._enrich_with_realtime(results)
+
+        # 按综合得分排序（技术面*0.5 + 基本面*0.5），优先钟摆回踩到位
         if self.no_fundamental:
-            results.sort(key=lambda x: (x['strength'], -x['dev_ma20']), reverse=True)
+            results.sort(key=lambda x: (x['strength'], x['pendulum_score'], -abs(x.get('rt_dev_ma20', x['dev_ma20']))), reverse=True)
         else:
-            results.sort(key=lambda x: (x['combined_score'], x['strength'], -x['dev_ma20']), reverse=True)
+            results.sort(key=lambda x: (x['combined_score'], x['pendulum_score'], x['strength'], -abs(x.get('rt_dev_ma20', x['dev_ma20']))), reverse=True)
 
         # 输出结果
         top_results = results[:self.top_n]
         self.results = top_results
 
+        # 数据日期说明
+        print(f"\n━━━ 数据说明 ━━━")
+        if has_realtime:
+            print(f"   历史K线: baostock（可能延迟1个交易日）")
+            print(f"   实时价格: adata（标记 [实时]，盘中自动更新）")
+        else:
+            print(f"   数据源: baostock（历史K线，可能延迟1个交易日）")
+            print(f"   ⚠️ 实时行情不可用，价格为最近收盘价")
+
         print(f"\n━━━ 筛选结果：{len(results)} 只股票符合趋势向上条件 ━━━")
         sort_label = "综合得分" if not self.no_fundamental else "趋势强度"
-        print(f"   显示前 {len(top_results)} 只（按{sort_label}排序）\n")
+        print(f"   显示前 {len(top_results)} 只（按{sort_label}+钟摆位置排序）")
+        print(f"   优先展示回踩MA20附近的股票（偏离度低=买点好）\n")
 
         # 表头
         if self.no_fundamental:
-            print(f"{'排名':<4} {'代码':<8} {'名称':<8} {'价格':>8} {'强度':>4} {'均线排列':<24} {'偏离MA20':>8} {'偏离MA60':>8} {'钟摆位置':<14} {'做T':>4}")
-            print("-" * 110)
+            print(f"{'排名':<4} {'代码':<8} {'名称':<8} {'价格':>10} {'强度':>4} {'均线排列':<24} {'偏离MA20':>8} {'偏离MA60':>8} {'钟摆位置':<14} {'做T':>4}")
+            print("-" * 115)
             for i, r in enumerate(top_results, 1):
-                print(f"{i:<4} {r['code']:<8} {r['name']:<8} {r['price']:>8.2f} {r['strength']:>3}/10 {r['ma_desc']:<24} {r['dev_ma20']:>+7.1f}% {r['dev_ma60']:>+7.1f}% {r['pendulum']:<14} {r['t0_label']:>4}")
+                price_str, dev_str = self._format_price_dev(r, has_realtime)
+                print(f"{i:<4} {r['code']:<8} {r['name']:<8} {price_str:>10} {r['strength']:>3}/10 {r['ma_desc']:<24} {dev_str:>8} {r['dev_ma60']:>+7.1f}% {r['pendulum']:<14} {r['t0_label']:>4}")
         else:
-            print(f"{'排名':<4} {'代码':<8} {'名称':<8} {'价格':>8} {'技术':>4} {'基本面':>5} {'综合':>4} {'均线排列':<24} {'偏离MA20':>8} {'钟摆位置':<14} {'做T':>4}")
-            print("-" * 120)
+            print(f"{'排名':<4} {'代码':<8} {'名称':<8} {'价格':>10} {'技术':>4} {'基本面':>5} {'综合':>4} {'均线排列':<24} {'偏离MA20':>8} {'钟摆位置':<14} {'做T':>4}")
+            print("-" * 125)
             for i, r in enumerate(top_results, 1):
-                print(f"{i:<4} {r['code']:<8} {r['name']:<8} {r['price']:>8.2f} {r['strength']:>3}/10 {r['fund_score']:>3}/10 {r['combined_score']:>4.1f} {r['ma_desc']:<24} {r['dev_ma20']:>+7.1f}% {r['pendulum']:<14} {r['t0_label']:>4}")
+                price_str, dev_str = self._format_price_dev(r, has_realtime)
+                print(f"{i:<4} {r['code']:<8} {r['name']:<8} {price_str:>10} {r['strength']:>3}/10 {r['fund_score']:>3}/10 {r['combined_score']:>4.1f} {r['ma_desc']:<24} {dev_str:>8} {r['pendulum']:<14} {r['t0_label']:>4}")
 
-        # 最佳做T候选
-        t0_candidates = [r for r in top_results if r['pendulum_score'] >= 2 and r['strength'] >= 5]
+        # 最佳做T候选（严格：偏离MA20 < 3%）
+        t0_candidates = [r for r in top_results if r['pendulum_score'] >= 2 and r['strength'] >= 5 and abs(r.get('rt_dev_ma20', r['dev_ma20'])) <= 5]
         if t0_candidates:
             print(f"\n━━━ 最佳做T候选（趋势强 + 回踩均线附近）━━━")
             print(f"   这些股票趋势向上且钟摆回摆至MA20附近，适合「顺大势逆小势」做T\n")
@@ -375,10 +430,20 @@ class TrendStockSelector:
                     trend_def = '高点递增'
                 elif r['lows_rising']:
                     trend_def = '低点递增'
-                print(f"   ⭐ {r['code']} {r['name']} ¥{r['price']:.2f} | 强度{r['strength']}/10 | {r['pendulum']} | {trend_def}")
+                dev_val = r.get('rt_dev_ma20', r['dev_ma20'])
+                price_val = r.get('rt_price', r['price'])
+                print(f"   ⭐ {r['code']} {r['name']} ¥{price_val:.2f} | 强度{r['strength']}/10 | 偏离MA20:{dev_val:+.1f}% | {trend_def}")
         else:
             print(f"\n━━━ 做T候选 ━━━")
             print("   当前无理想做T候选（趋势向上但钟摆偏高，建议等待回踩）")
+
+        # 高位提醒
+        high_stocks = [r for r in top_results if r.get('rt_dev_ma20', r['dev_ma20']) > 5]
+        if high_stocks:
+            print(f"\n━━━ ⚠️ 高位提醒（偏离MA20 > 5%，追高风险大）━━━")
+            for r in high_stocks[:5]:
+                dev_val = r.get('rt_dev_ma20', r['dev_ma20'])
+                print(f"   ⚠️ {r['code']} {r['name']} 偏离MA20:{dev_val:+.1f}% — 建议等回调至MA20附近再买入")
 
         # 内功提醒
         print(f"\n━━━ 内功提醒 ━━━")
@@ -400,6 +465,17 @@ class TrendStockSelector:
         print(f"⏰ 报告时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"📊 共分析 {total} 只股票，筛选出 {len(results)} 只趋势向上")
         print(f"{'=' * 70}\n")
+
+    @staticmethod
+    def _format_price_dev(r, has_realtime):
+        """格式化价格和偏离度显示（带实时标记）"""
+        if has_realtime and 'rt_price' in r:
+            price_str = f"{r['rt_price']:.2f}*"
+            dev_str = f"{r['rt_dev_ma20']:+.1f}%*"
+        else:
+            price_str = f"{r['price']:.2f}"
+            dev_str = f"{r['dev_ma20']:+.1f}%"
+        return price_str, dev_str
 
 
 def main():

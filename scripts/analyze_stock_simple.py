@@ -105,7 +105,7 @@ class SimpleStockAnalyzer:
             return False
 
     def fetch_market_data(self):
-        """获取市场数据（使用 baostock）"""
+        """获取市场数据（baostock + adata 实时行情补充）"""
         try:
             # 获取上证指数
             try:
@@ -120,8 +120,31 @@ class SimpleStockAnalyzer:
             except:
                 pass
 
-            # 行业数据暂时无法从 baostock 获取，跳过
-            # 可以考虑从其他数据源补充，或者不显示行业数据
+            # 尝试用 adata 获取实时行情补充当前价格
+            self._realtime_data = {}
+            try:
+                rt = DataSource.get_realtime_quote([self.stock_code])
+                if rt is not None and not rt.empty:
+                    row = rt.iloc[0]
+                    price_col = 'price' if 'price' in row.index else ('trade_price' if 'trade_price' in row.index else None)
+                    if price_col and pd.notna(row[price_col]) and float(row[price_col]) > 0:
+                        self._realtime_data['price'] = float(row[price_col])
+                    chg_col = 'change_pct' if 'change_pct' in row.index else ('pct_chg' if 'pct_chg' in row.index else None)
+                    if chg_col and pd.notna(row[chg_col]):
+                        self._realtime_data['change_pct'] = float(row[chg_col])
+                    name_col = 'short_name' if 'short_name' in row.index else ('name' if 'name' in row.index else None)
+                    if name_col and pd.notna(row[name_col]):
+                        self._realtime_data['name'] = str(row[name_col])
+            except:
+                pass
+
+            # 用实时数据更新当前价格和名称
+            if self._realtime_data.get('price'):
+                self.data['rt_price'] = self._realtime_data['price']
+                self.data['rt_change_pct'] = self._realtime_data.get('change_pct')
+            if self._realtime_data.get('name'):
+                self.data['name'] = self._realtime_data['name']
+
         except:
             pass
 
@@ -592,10 +615,17 @@ class SimpleStockAnalyzer:
             emoji = "📈" if industry['change_pct'] > 0 else "📉"
             print(f"板块: {industry['name']} ({emoji} {industry['change_pct']:+.2f}%)")
 
-        # 当前价格
+        # 当前价格（含实时行情）
         print("\n━━━ 当前状态 ━━━")
-        emoji = "📈" if self.data['change_pct'] > 0 else "📉"
-        print(f"当前价: ¥{self.data['current_price']:.2f} ({emoji} {self.data['change_pct']:+.2f}%)")
+        data_date = self.df.iloc[-1]['日期'] if '日期' in self.df.columns else '未知'
+        if self.data.get('rt_price'):
+            rt_chg = self.data.get('rt_change_pct')
+            rt_emoji = "📈" if rt_chg and rt_chg > 0 else "📉"
+            print(f"实时价: ¥{self.data['rt_price']:.2f} ({rt_emoji} {rt_chg:+.2f}%) [adata实时]")
+            print(f"收盘价: ¥{self.data['current_price']:.2f} [K线数据 {data_date}]")
+        else:
+            emoji = "📈" if self.data['change_pct'] > 0 else "📉"
+            print(f"收盘价: ¥{self.data['current_price']:.2f} ({emoji} {self.data['change_pct']:+.2f}%) [K线数据 {data_date}]")
         print(f"今日区间: ¥{self.data['low']:.2f} - ¥{self.data['high']:.2f}")
 
         # 多级别趋势
