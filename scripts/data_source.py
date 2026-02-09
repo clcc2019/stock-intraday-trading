@@ -4,8 +4,9 @@
 避免单一数据源限流导致功能不可用
 
 数据源优先级：
-1. baostock（主）：稳定、免费、不限流，来自证券交易所
-2. akshare（备）：数据丰富，但可能限流
+1. baostock（主）：稳定、免费、不限流，来自证券交易所（历史K线）
+2. akshare（备）：历史K线备用
+3. adata（补充）：实时行情、资金流向、分时行情、5档盘口
 
 优化策略：
 - 自动重试和降级切换
@@ -22,6 +23,26 @@ import time
 import hashlib
 
 warnings.filterwarnings('ignore')
+
+# 延迟导入 adata（可选依赖）
+_adata = None
+_adata_available = None  # None=未检测, True=可用, False=不可用
+
+
+def _get_adata():
+    """延迟导入 adata"""
+    global _adata, _adata_available
+    if _adata_available is False:
+        return None
+    if _adata is None:
+        try:
+            import adata
+            _adata = adata
+            _adata_available = True
+        except ImportError:
+            _adata_available = False
+            return None
+    return _adata
 
 
 class DataSource:
@@ -466,6 +487,180 @@ class DataSource:
             except Exception:
                 continue
         return results
+
+    # ============================================================
+    # adata 补充数据源：实时行情 / 资金流向 / 分时 / 5档盘口
+    # ============================================================
+
+    @classmethod
+    def get_realtime_quote(cls, stock_codes):
+        """
+        获取实时行情（来源：adata，新浪/腾讯）
+        
+        参数:
+            stock_codes: 股票代码列表，如 ['600519', '002594']
+        
+        返回:
+            DataFrame: stock_code, short_name, price, change, change_pct, volume, amount
+            失败返回 None
+        """
+        cache_key = cls._get_cache_key('realtime', tuple(sorted(stock_codes)))
+        cached = cls._get_cache(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+        ad = _get_adata()
+        if ad is None:
+            return None
+        try:
+            df = ad.stock.market.list_market_current(code_list=stock_codes)
+            if df is not None and not df.empty:
+                # 短缓存（30秒）
+                cls._cache[cache_key] = (df, time.time())
+                return df
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def get_capital_flow(cls, stock_code, days=30):
+        """
+        获取资金流向（来源：adata，东方财富）
+        
+        参数:
+            stock_code: 6位股票代码
+            days: 返回最近 N 天的数据
+        
+        返回:
+            DataFrame: stock_code, trade_date, main_net_inflow, sm_net_inflow,
+                       mid_net_inflow, lg_net_inflow, max_net_inflow
+            失败返回 None
+        """
+        cache_key = cls._get_cache_key('capital_flow', stock_code)
+        cached = cls._get_cache(cache_key)
+        if cached is not None:
+            return cached.tail(days).copy()
+
+        ad = _get_adata()
+        if ad is None:
+            return None
+        try:
+            df = ad.stock.market.get_capital_flow(stock_code=stock_code)
+            if df is not None and not df.empty:
+                cls._set_cache(cache_key, df)
+                return df.tail(days).copy()
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def get_intraday_minute(cls, stock_code):
+        """
+        获取今日分时行情（来源：adata）
+        
+        参数:
+            stock_code: 6位股票代码
+        
+        返回:
+            DataFrame: stock_code, trade_time, price, change, change_pct,
+                       volume, avg_price, amount
+            失败返回 None
+        """
+        cache_key = cls._get_cache_key('intraday_min', stock_code, datetime.now().strftime('%Y%m%d'))
+        cached = cls._get_cache(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+        ad = _get_adata()
+        if ad is None:
+            return None
+        try:
+            df = ad.stock.market.get_market_min(stock_code=stock_code)
+            if df is not None and not df.empty:
+                # 短缓存（60秒）
+                cls._cache[cache_key] = (df, time.time())
+                return df
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def get_market_five(cls, stock_code):
+        """
+        获取5档盘口行情（来源：adata）
+        
+        参数:
+            stock_code: 6位股票代码
+        
+        返回:
+            DataFrame: 包含 s1-s5(卖价), sv1-sv5(卖量), b1-b5(买价), bv1-bv5(买量)
+            失败返回 None
+        """
+        ad = _get_adata()
+        if ad is None:
+            return None
+        try:
+            df = ad.stock.market.get_market_five(stock_code=stock_code)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def get_stock_concepts(cls, stock_code):
+        """
+        获取股票所属概念板块（来源：adata，东方财富）
+        
+        参数:
+            stock_code: 6位股票代码
+        
+        返回:
+            DataFrame: stock_code, concept_code, name, source, reason
+            失败返回 None
+        """
+        cache_key = cls._get_cache_key('concepts', stock_code)
+        cached = cls._get_cache(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+        ad = _get_adata()
+        if ad is None:
+            return None
+        try:
+            df = ad.stock.info.get_concept_east(stock_code=stock_code)
+            if df is not None and not df.empty:
+                cls._set_cache(cache_key, df)
+                return df
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def get_index_realtime(cls):
+        """
+        获取指数实时行情（来源：adata）
+        
+        返回:
+            DataFrame: index_code, trade_time, open, high, low, price, volume, amount, change, change_pct
+            失败返回 None
+        """
+        cache_key = cls._get_cache_key('index_realtime')
+        cached = cls._get_cache(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+        ad = _get_adata()
+        if ad is None:
+            return None
+        try:
+            df = ad.stock.market.get_market_index_current()
+            if df is not None and not df.empty:
+                cls._cache[cache_key] = (df, time.time())
+                return df
+        except Exception:
+            pass
+        return None
 
 
 def main():
