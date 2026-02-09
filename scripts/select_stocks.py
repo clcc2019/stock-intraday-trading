@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fundamental_analyzer import FundamentalAnalyzer
 from data_source import DataSource
-from technical import calculate_ma, detect_highs_lows, analyze_ma_alignment, _safe_ma
+from technical import calculate_ma, calculate_macd, calculate_kdj, detect_highs_lows, analyze_ma_alignment, _safe_ma
 
 
 class TrendStockSelector:
@@ -139,6 +139,9 @@ class TrendStockSelector:
 
             # 计算均线（使用公共模块）
             calculate_ma(df, windows=[5, 10, 20, 60, 120, 250])
+            # 计算 MACD 和 KDJ（用于高位接盘过滤）
+            calculate_macd(df)
+            calculate_kdj(df)
 
             latest = df.iloc[-1]
             price = latest['收盘']
@@ -183,6 +186,62 @@ class TrendStockSelector:
             if dev_ma60 > 20:
                 return None
 
+            # === MACD/KDJ 高位接盘过滤 ===
+            overbought_flags = []
+            overbought_penalty = 0  # 扣分（0-3分）
+
+            # KDJ 超买检测
+            j_val = latest.get('J', 50)
+            k_val = latest.get('K', 50)
+            d_val = latest.get('D', 50)
+            if not (isinstance(j_val, float) and np.isnan(j_val)):
+                if j_val > 90 and k_val > d_val:
+                    # J > 90 但 K 仍在 D 上方 = 强势超买还没死叉，轻度扣分
+                    overbought_flags.append(f'KDJ超买(J={j_val:.0f})')
+                    overbought_penalty += 1
+                if j_val > 80 and len(df) >= 2:
+                    prev_k = df.iloc[-2].get('K', 0)
+                    prev_d = df.iloc[-2].get('D', 0)
+                    # K/D 死叉：前一天 K > D，今天 K < D → 超买死叉，重度扣分
+                    if prev_k > prev_d and k_val < d_val:
+                        overbought_flags.append(f'KDJ高位死叉(J={j_val:.0f})')
+                        overbought_penalty += 2
+                    # J 极值钝化 > 100
+                    if j_val > 100:
+                        overbought_flags.append(f'J值极端({j_val:.0f})')
+                        overbought_penalty += 1
+
+            # MACD 顶背离检测（价格新高但 MACD 柱缩短）
+            dif_val = latest.get('DIF', 0)
+            macd_val = latest.get('MACD', 0)
+            if not (isinstance(dif_val, float) and np.isnan(dif_val)):
+                if len(df) >= 20:
+                    recent_20 = df.tail(20)
+                    price_high_idx = recent_20['收盘'].idxmax()
+                    # 价格在近20日高位（前3名）
+                    price_rank = (recent_20['收盘'] >= price).sum()
+                    if price_rank <= 3:
+                        # 检查 MACD 柱是否在缩短（近5日 MACD 柱连续缩短）
+                        recent_macd = df['MACD'].tail(5).tolist()
+                        if len(recent_macd) >= 5:
+                            # MACD 柱从正值开始缩短 = 上涨动能衰竭
+                            if recent_macd[-1] > 0 and recent_macd[-1] < recent_macd[-3]:
+                                overbought_flags.append('MACD柱缩短(动能衰竭)')
+                                overbought_penalty += 1
+                            # DIF/DEA 死叉（DIF 下穿 DEA）
+                            if len(df) >= 2:
+                                prev_dif = df.iloc[-2].get('DIF', 0)
+                                prev_dea = df.iloc[-2].get('DEA', 0)
+                                dea_val = latest.get('DEA', 0)
+                                if not (isinstance(prev_dif, float) and np.isnan(prev_dif)):
+                                    if prev_dif > prev_dea and dif_val < dea_val:
+                                        overbought_flags.append('MACD死叉')
+                                        overbought_penalty += 2
+
+            # 极端超买直接过滤（扣分 >= 4 表示多个超买信号同时出现）
+            if overbought_penalty >= 4:
+                return None
+
             # === 趋势定义验证（使用公共模块）===
             hl = detect_highs_lows(df)
             highs_rising = hl['highs_rising']
@@ -223,6 +282,39 @@ class TrendStockSelector:
             elif change_20d > 0:
                 strength += 1
 
+            # === MACD/KDJ 动态加减分 ===
+            momentum_bonus = 0
+            momentum_flags = []
+            if not (isinstance(macd_val, float) and np.isnan(macd_val)):
+                # MACD 金叉加分（DIF 上穿 DEA）
+                if len(df) >= 2:
+                    prev_dif = df.iloc[-2].get('DIF', 0)
+                    prev_dea = df.iloc[-2].get('DEA', 0)
+                    dea_val = latest.get('DEA', 0)
+                    if not (isinstance(prev_dif, float) and np.isnan(prev_dif)):
+                        if prev_dif < prev_dea and dif_val > dea_val:
+                            momentum_bonus += 1
+                            momentum_flags.append('MACD金叉')
+                # MACD 零轴上方，柱递增 = 强势
+                recent_macd = df['MACD'].tail(3).tolist()
+                if len(recent_macd) >= 3 and all(v > 0 for v in recent_macd if not (isinstance(v, float) and np.isnan(v))):
+                    if recent_macd[-1] > recent_macd[-2]:
+                        momentum_bonus += 1
+                        momentum_flags.append('MACD红柱增长')
+
+            if not (isinstance(j_val, float) and np.isnan(j_val)):
+                # KDJ 金叉加分（K 上穿 D，且不在超买区）
+                if j_val < 80 and len(df) >= 2:
+                    prev_k = df.iloc[-2].get('K', 50)
+                    prev_d = df.iloc[-2].get('D', 50)
+                    if prev_k < prev_d and k_val > d_val:
+                        momentum_bonus += 1
+                        momentum_flags.append('KDJ金叉')
+
+            # 应用超买扣分和动能加分
+            strength = max(0, strength - overbought_penalty + min(2, momentum_bonus))
+            strength = min(10, strength)
+
             # === 钟摆位置评估（更严格的分级）===
             if dev_ma20 <= 2:
                 pendulum = '回踩MA20附近'
@@ -240,10 +332,14 @@ class TrendStockSelector:
                 pendulum = '过度偏高'
                 pendulum_score = 0
 
+            # 超买信号降低钟摆评分
+            if overbought_penalty >= 2:
+                pendulum_score = max(0, pendulum_score - 1)
+
             # === 做T适合度（钟摆位置是关键因素）===
-            if strength >= 6 and pendulum_score >= 3:
-                t0_label = '⭐⭐⭐'  # 趋势强+回踩到位
-            elif strength >= 5 and pendulum_score >= 2:
+            if strength >= 6 and pendulum_score >= 3 and overbought_penalty == 0:
+                t0_label = '⭐⭐⭐'  # 趋势强+回踩到位+无超买
+            elif strength >= 5 and pendulum_score >= 2 and overbought_penalty <= 1:
                 t0_label = '⭐⭐'    # 趋势好+位置尚可
             elif strength >= 4 and pendulum_score >= 2:
                 t0_label = '⭐'      # 基本可做
@@ -277,6 +373,9 @@ class TrendStockSelector:
                 'highs_rising': highs_rising,
                 'lows_rising': lows_rising,
                 'change_20d': change_20d,
+                'overbought_flags': overbought_flags,
+                'overbought_penalty': overbought_penalty,
+                'momentum_flags': momentum_flags,
                 'fund_score': 0,
                 'fund_max': 10,
                 'combined_score': strength,  # 默认等于技术面强度
@@ -417,11 +516,14 @@ class TrendStockSelector:
                 price_str, dev_str = self._format_price_dev(r, has_realtime)
                 print(f"{i:<4} {r['code']:<8} {r['name']:<8} {price_str:>10} {r['strength']:>3}/10 {r['fund_score']:>3}/10 {r['combined_score']:>4.1f} {r['ma_desc']:<24} {dev_str:>8} {r['pendulum']:<14} {r['t0_label']:>4}")
 
-        # 最佳做T候选（严格：偏离MA20 < 3%）
-        t0_candidates = [r for r in top_results if r['pendulum_score'] >= 2 and r['strength'] >= 5 and abs(r.get('rt_dev_ma20', r['dev_ma20'])) <= 5]
+        # 最佳做T候选（严格：偏离MA20 < 5% + 无超买信号）
+        t0_candidates = [r for r in top_results
+                         if r['pendulum_score'] >= 2 and r['strength'] >= 5
+                         and abs(r.get('rt_dev_ma20', r['dev_ma20'])) <= 5
+                         and r.get('overbought_penalty', 0) == 0]
         if t0_candidates:
-            print(f"\n━━━ 最佳做T候选（趋势强 + 回踩均线附近）━━━")
-            print(f"   这些股票趋势向上且钟摆回摆至MA20附近，适合「顺大势逆小势」做T\n")
+            print(f"\n━━━ 最佳做T候选（趋势强 + 回踩均线 + MACD/KDJ健康）━━━")
+            print(f"   这些股票趋势向上、钟摆回摆至MA20附近、无超买信号\n")
             for r in t0_candidates[:10]:
                 trend_def = ''
                 if r['highs_rising'] and r['lows_rising']:
@@ -432,13 +534,27 @@ class TrendStockSelector:
                     trend_def = '低点递增'
                 dev_val = r.get('rt_dev_ma20', r['dev_ma20'])
                 price_val = r.get('rt_price', r['price'])
-                print(f"   ⭐ {r['code']} {r['name']} ¥{price_val:.2f} | 强度{r['strength']}/10 | 偏离MA20:{dev_val:+.1f}% | {trend_def}")
+                mom_str = ' '.join(r.get('momentum_flags', []))
+                if mom_str:
+                    mom_str = f' | {mom_str}'
+                print(f"   ⭐ {r['code']} {r['name']} ¥{price_val:.2f} | 强度{r['strength']}/10 | 偏离MA20:{dev_val:+.1f}% | {trend_def}{mom_str}")
         else:
             print(f"\n━━━ 做T候选 ━━━")
-            print("   当前无理想做T候选（趋势向上但钟摆偏高，建议等待回踩）")
+            print("   当前无理想做T候选（趋势向上但钟摆偏高或指标超买，建议等待回踩）")
 
-        # 高位提醒
-        high_stocks = [r for r in top_results if r.get('rt_dev_ma20', r['dev_ma20']) > 5]
+        # MACD/KDJ 超买预警
+        overbought_stocks = [r for r in top_results if r.get('overbought_penalty', 0) >= 1]
+        if overbought_stocks:
+            print(f"\n━━━ ⚠️ MACD/KDJ超买预警（趋势向上但短期接盘风险高）━━━")
+            for r in overbought_stocks[:8]:
+                flags_str = ', '.join(r.get('overbought_flags', []))
+                dev_val = r.get('rt_dev_ma20', r['dev_ma20'])
+                print(f"   ⚠️ {r['code']} {r['name']} 偏离MA20:{dev_val:+.1f}% | {flags_str} — 建议等MACD/KDJ修复后再买入")
+
+        # 高位提醒（偏离度高但无超买信号的）
+        high_stocks = [r for r in top_results
+                       if r.get('rt_dev_ma20', r['dev_ma20']) > 5
+                       and r.get('overbought_penalty', 0) == 0]
         if high_stocks:
             print(f"\n━━━ ⚠️ 高位提醒（偏离MA20 > 5%，追高风险大）━━━")
             for r in high_stocks[:5]:
