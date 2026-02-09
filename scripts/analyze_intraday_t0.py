@@ -114,8 +114,24 @@ class IntradayT0Analyzer:
                 self.data['open'] = self.df_minute.iloc[0]['开盘']
                 self.data['change_pct'] = ((self.data['current_price'] - self.data['open']) / self.data['open']) * 100
 
-            # baostock 数据中已包含股票代码，名称暂时保持默认
-            pass
+            # 尝试获取实时数据覆盖
+            realtime = DataSource.get_current_data(self.stock_code)
+            if realtime and realtime['source'] == 'realtime':
+                self.data['current_price'] = realtime['price']
+                self.data['change_pct'] = realtime['change_pct']
+                self.data['name'] = realtime['name']
+                if realtime['high'] > 0:
+                    self.data['high'] = realtime['high']
+                if realtime['low'] > 0:
+                    self.data['low'] = realtime['low']
+                if realtime['open'] > 0:
+                    self.data['open'] = realtime['open']
+                self.data['data_source'] = '实时'
+            elif realtime:
+                self.data['name'] = realtime['name']
+                self.data['data_source'] = f"历史({realtime['data_time']})"
+            else:
+                self.data['data_source'] = f"历史({latest_daily['日期']})"
 
             # 计算技术指标
             self.calculate_indicators()
@@ -132,16 +148,10 @@ class IntradayT0Analyzer:
             return False
 
     def fetch_market_data(self):
-        """获取市场数据（使用 baostock）"""
+        """获取市场数据（优先 adata 实时，降级 baostock）"""
         try:
-            sz_df = DataSource.get_stock_hist('000001', period='daily')
-            if sz_df is not None and not sz_df.empty and len(sz_df) >= 2:
-                latest_sz = sz_df.iloc[-1]
-                prev_sz = sz_df.iloc[-2]
-                self.market_data['上证指数'] = {
-                    'price': latest_sz['收盘'],
-                    'change_pct': ((latest_sz['收盘'] - prev_sz['收盘']) / prev_sz['收盘']) * 100
-                }
+            index_data = DataSource.get_market_index()
+            self.market_data.update(index_data)
         except:
             pass
 
@@ -654,9 +664,10 @@ class IntradayT0Analyzer:
         print("=" * 70)
 
         # 实时状态
-        print("\n━━━ 实时状态 ━━━")
+        print(f"\n━━━ 实时状态 ━━━")
         emoji = "📈" if self.data['change_pct'] > 0 else "📉"
-        print(f"当前价: ¥{self.data['current_price']:.2f} ({emoji} {self.data['change_pct']:+.2f}%)")
+        source_tag = f"[{self.data.get('data_source', '历史')}]" if self.data.get('data_source') else ""
+        print(f"当前价: ¥{self.data['current_price']:.2f} ({emoji} {self.data['change_pct']:+.2f}%) {source_tag}")
         print(f"今日区间: ¥{self.data['low']:.2f} - ¥{self.data['high']:.2f}")
         print(f"分析时间: {result['current_time']}")
 

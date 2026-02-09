@@ -489,6 +489,149 @@ class DataSource:
         return results
 
     # ============================================================
+    # 实时数据层：优先 adata 实时，降级到 baostock 历史
+    # ============================================================
+
+    @classmethod
+    def get_current_data(cls, stock_code):
+        """
+        获取股票当前/最新数据（智能切换：盘中用实时，收盘后用历史）
+        
+        返回:
+            dict: {
+                'price': 当前价/最新收盘价,
+                'name': 股票中文名称,
+                'change_pct': 涨跌幅(%),
+                'high': 今日最高,
+                'low': 今日最低,
+                'open': 今日开盘,
+                'volume': 成交量,
+                'amount': 成交额,
+                'source': 数据来源 ('realtime'/'history'),
+                'data_time': 数据时间描述,
+            }
+            失败返回 None
+        """
+        # 优先尝试 adata 实时行情
+        try:
+            rt = cls.get_realtime_quote([stock_code])
+            if rt is not None and not rt.empty:
+                row = rt.iloc[0]
+                price = float(row.get('price', 0))
+                if price > 0:
+                    result = {
+                        'price': price,
+                        'name': str(row.get('short_name', f'股票{stock_code}')),
+                        'change_pct': float(row.get('change_pct', 0)),
+                        'high': 0,  # adata 实时行情不含 high/low/open
+                        'low': 0,
+                        'open': 0,
+                        'volume': int(row.get('volume', 0)) if 'volume' in row.index else 0,
+                        'amount': float(row.get('amount', 0)) if 'amount' in row.index else 0,
+                        'source': 'realtime',
+                        'data_time': '实时',
+                    }
+                    # 有些字段 adata 可能返回也可能不返回
+                    if 'high' in row.index and float(row['high']) > 0:
+                        result['high'] = float(row['high'])
+                    if 'low' in row.index and float(row['low']) > 0:
+                        result['low'] = float(row['low'])
+                    if 'open' in row.index and float(row['open']) > 0:
+                        result['open'] = float(row['open'])
+                    return result
+        except Exception:
+            pass
+
+        # 降级：从 baostock 历史数据取最后一条
+        try:
+            df = cls.get_stock_hist(stock_code, period='daily')
+            if df is not None and not df.empty:
+                latest = df.iloc[-1]
+                prev = df.iloc[-2] if len(df) >= 2 else latest
+                return {
+                    'price': float(latest['收盘']),
+                    'name': f'股票{stock_code}',
+                    'change_pct': ((float(latest['收盘']) - float(prev['收盘'])) / float(prev['收盘'])) * 100,
+                    'high': float(latest['最高']),
+                    'low': float(latest['最低']),
+                    'open': float(latest['开盘']),
+                    'volume': int(latest['成交量']),
+                    'amount': float(latest.get('成交额', 0)),
+                    'source': 'history',
+                    'data_time': str(latest['日期']),
+                }
+        except Exception:
+            pass
+
+        return None
+
+    @classmethod
+    def get_market_index(cls):
+        """
+        获取主要指数实时数据（智能切换：优先 adata 实时，降级 baostock）
+        
+        返回:
+            dict: {
+                '上证指数': {'price': 价格, 'change_pct': 涨跌幅, 'source': 来源},
+                '深证成指': {...},
+                '创业板指': {...},
+            }
+            失败返回空 dict
+        """
+        result = {}
+
+        # 优先尝试 adata 实时指数
+        try:
+            idx_df = cls.get_index_realtime()
+            if idx_df is not None and not idx_df.empty:
+                index_map = {
+                    '000001': '上证指数',
+                    '399001': '深证成指',
+                    '399006': '创业板指',
+                }
+                for _, row in idx_df.iterrows():
+                    code = str(row.get('index_code', ''))
+                    if code in index_map:
+                        price = float(row.get('price', 0))
+                        if price > 0:
+                            result[index_map[code]] = {
+                                'price': price,
+                                'change_pct': float(row.get('change_pct', 0)),
+                                'source': 'realtime',
+                            }
+                if '上证指数' in result:
+                    return result
+        except Exception:
+            pass
+
+        # 降级：baostock 获取上证指数（注意：需要用 sh.000001）
+        try:
+            cls.login()
+            rs = bs.query_history_k_data_plus(
+                'sh.000001',
+                'date,close',
+                start_date=(datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d'),
+                end_date=datetime.now().strftime('%Y-%m-%d'),
+                frequency='d',
+                adjustflag='3'
+            )
+            data_list = []
+            while rs.next():
+                data_list.append(rs.get_row_data())
+            if len(data_list) >= 2:
+                latest_close = float(data_list[-1][1])
+                prev_close = float(data_list[-2][1])
+                result['上证指数'] = {
+                    'price': latest_close,
+                    'change_pct': ((latest_close - prev_close) / prev_close) * 100,
+                    'source': 'history',
+                }
+        except Exception:
+            pass
+
+        return result
+
+    # ============================================================
     # adata 补充数据源：实时行情 / 资金流向 / 分时 / 5档盘口
     # ============================================================
 

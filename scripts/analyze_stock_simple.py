@@ -86,12 +86,24 @@ class SimpleStockAnalyzer:
                 'turnover': latest['换手率'] if '换手率' in latest else 0
             }
 
-            # baostock 数据中已包含股票代码，可从中提取名称
-            # 但为了兼容性，仍保留从 code 列提取（如果有）
-            if 'code' in self.df.columns and not self.df.empty:
-                # baostock 返回的 code 格式如 'sh.600519'
-                # 名称需要单独查询，暂时保持默认
-                pass
+            # 尝试获取实时数据覆盖（盘中更准确）
+            realtime = DataSource.get_current_data(self.stock_code)
+            if realtime and realtime['source'] == 'realtime':
+                self.data['current_price'] = realtime['price']
+                self.data['change_pct'] = realtime['change_pct']
+                self.data['name'] = realtime['name']
+                if realtime['high'] > 0:
+                    self.data['high'] = realtime['high']
+                if realtime['low'] > 0:
+                    self.data['low'] = realtime['low']
+                if realtime['open'] > 0:
+                    self.data['open'] = realtime['open']
+                self.data['data_source'] = '实时'
+            elif realtime:
+                self.data['name'] = realtime['name']
+                self.data['data_source'] = f"历史({realtime['data_time']})"
+            else:
+                self.data['data_source'] = f"历史({latest['日期']})"
 
             self.calculate_indicators()
             self.fetch_market_data()
@@ -105,23 +117,10 @@ class SimpleStockAnalyzer:
             return False
 
     def fetch_market_data(self):
-        """获取市场数据（使用 baostock）"""
+        """获取市场数据（优先 adata 实时，降级 baostock）"""
         try:
-            # 获取上证指数
-            try:
-                sz_df = DataSource.get_stock_hist('000001', period='daily')
-                if sz_df is not None and not sz_df.empty and len(sz_df) >= 2:
-                    latest_sz = sz_df.iloc[-1]
-                    prev_sz = sz_df.iloc[-2]
-                    self.market_data['上证指数'] = {
-                        'price': latest_sz['收盘'],
-                        'change_pct': ((latest_sz['收盘'] - prev_sz['收盘']) / prev_sz['收盘']) * 100
-                    }
-            except:
-                pass
-
-            # 行业数据暂时无法从 baostock 获取，跳过
-            # 可以考虑从其他数据源补充，或者不显示行业数据
+            index_data = DataSource.get_market_index()
+            self.market_data.update(index_data)
         except:
             pass
 
@@ -593,9 +592,10 @@ class SimpleStockAnalyzer:
             print(f"板块: {industry['name']} ({emoji} {industry['change_pct']:+.2f}%)")
 
         # 当前价格
-        print("\n━━━ 当前状态 ━━━")
+        print(f"\n━━━ 当前状态 ━━━")
         emoji = "📈" if self.data['change_pct'] > 0 else "📉"
-        print(f"当前价: ¥{self.data['current_price']:.2f} ({emoji} {self.data['change_pct']:+.2f}%)")
+        source_tag = f"[{self.data.get('data_source', '历史')}]" if self.data.get('data_source') else ""
+        print(f"当前价: ¥{self.data['current_price']:.2f} ({emoji} {self.data['change_pct']:+.2f}%) {source_tag}")
         print(f"今日区间: ¥{self.data['low']:.2f} - ¥{self.data['high']:.2f}")
 
         # 多级别趋势
