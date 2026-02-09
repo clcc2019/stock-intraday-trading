@@ -10,13 +10,18 @@
 - 均线=玄铁重剑，MACD/KDJ仅作可选参考
 """
 
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import warnings
-import time
+import os
+import sys
+
 warnings.filterwarnings('ignore')
+
+# 导入数据源适配层
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data_source import DataSource
 
 
 class IntradayT0Analyzer:
@@ -31,7 +36,7 @@ class IntradayT0Analyzer:
         self.market_data = {}
 
     def fetch_data(self):
-        """获取股票数据（扩展至300+天，支持MA120/MA250）"""
+        """获取股票数据（使用 baostock，扩展至300+天，支持MA120/MA250）"""
         try:
             print(f"📊 正在获取 {self.stock_code} 的数据...")
 
@@ -39,22 +44,13 @@ class IntradayT0Analyzer:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=400)
 
-            for attempt in range(3):
-                try:
-                    self.df_daily = ak.stock_zh_a_hist(
-                        symbol=self.stock_code,
-                        period="daily",
-                        start_date=start_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d'),
-                        adjust="qfq"
-                    )
-                    if self.df_daily is not None and not self.df_daily.empty:
-                        break
-                    time.sleep(1)
-                except Exception as e:
-                    if attempt == 2:
-                        raise e
-                    time.sleep(2)
+            self.df_daily = DataSource.get_stock_hist(
+                stock_code=self.stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                adjust='qfq',
+                period='daily'
+            )
 
             if self.df_daily is None or self.df_daily.empty:
                 print(f"❌ 无法获取日K线数据")
@@ -62,34 +58,31 @@ class IntradayT0Analyzer:
 
             # 2. 获取周K线数据（判断周级别趋势）
             try:
-                self.df_weekly = ak.stock_zh_a_hist(
-                    symbol=self.stock_code,
-                    period="weekly",
-                    start_date=(end_date - timedelta(days=400)).strftime('%Y%m%d'),
-                    end_date=end_date.strftime('%Y%m%d'),
-                    adjust="qfq"
+                self.df_weekly = DataSource.get_stock_hist(
+                    stock_code=self.stock_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust='qfq',
+                    period='weekly'
                 )
             except:
                 self.df_weekly = None
 
-            # 3. 获取实时分时数据
+            # 3. 获取实时分时数据（今日5分钟数据）
             try:
-                self.df_minute = ak.stock_zh_a_hist_min_em(
-                    symbol=self.stock_code,
-                    period='5',
-                    adjust='qfq'
+                today = datetime.now().strftime('%Y-%m-%d')
+                self.df_minute = DataSource.get_stock_hist_minute(
+                    stock_code=self.stock_code,
+                    start_date=today,
+                    end_date=today,
+                    adjust='qfq',
+                    period='5'
                 )
 
                 if self.df_minute is not None and not self.df_minute.empty:
-                    today = datetime.now().strftime('%Y-%m-%d')
-                    self.df_minute['日期'] = pd.to_datetime(self.df_minute['时间']).dt.strftime('%Y-%m-%d')
-                    self.df_minute = self.df_minute[self.df_minute['日期'] == today].copy()
-
-                    if self.df_minute.empty:
-                        print("⚠️ 今日暂无分时数据（可能未开盘或已收盘）")
-                    else:
-                        print(f"✅ 获取到 {len(self.df_minute)} 条分时数据")
+                    print(f"✅ 获取到 {len(self.df_minute)} 条分时数据")
                 else:
+                    print("⚠️ 今日暂无分时数据（可能未开盘或已收盘）")
                     self.df_minute = None
             except Exception as e:
                 print(f"⚠️ 分时数据获取失败: {e}")
@@ -117,15 +110,8 @@ class IntradayT0Analyzer:
                 self.data['open'] = self.df_minute.iloc[0]['开盘']
                 self.data['change_pct'] = ((self.data['current_price'] - self.data['open']) / self.data['open']) * 100
 
-            # 获取股票名称
-            try:
-                stock_name = ak.stock_individual_info_em(symbol=self.stock_code)
-                if stock_name is not None and not stock_name.empty:
-                    name_row = stock_name[stock_name['item'] == '股票简称']
-                    if not name_row.empty:
-                        self.data['name'] = name_row['value'].values[0]
-            except:
-                pass
+            # baostock 数据中已包含股票代码，名称暂时保持默认
+            pass
 
             # 计算技术指标
             self.calculate_indicators()
@@ -142,15 +128,15 @@ class IntradayT0Analyzer:
             return False
 
     def fetch_market_data(self):
-        """获取市场数据"""
+        """获取市场数据（使用 baostock）"""
         try:
-            sz_index = ak.stock_zh_index_daily(symbol="sh000001")
-            if sz_index is not None and not sz_index.empty:
-                latest_sz = sz_index.iloc[-1]
-                prev_sz = sz_index.iloc[-2]
+            sz_df = DataSource.get_stock_hist('000001', period='daily')
+            if sz_df is not None and not sz_df.empty and len(sz_df) >= 2:
+                latest_sz = sz_df.iloc[-1]
+                prev_sz = sz_df.iloc[-2]
                 self.market_data['上证指数'] = {
-                    'price': latest_sz['close'],
-                    'change_pct': ((latest_sz['close'] - prev_sz['close']) / prev_sz['close']) * 100
+                    'price': latest_sz['收盘'],
+                    'change_pct': ((latest_sz['收盘'] - prev_sz['收盘']) / prev_sz['收盘']) * 100
                 }
         except:
             pass

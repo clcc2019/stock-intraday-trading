@@ -21,9 +21,10 @@ import sys
 
 warnings.filterwarnings('ignore')
 
-# 导入基本面分析模块
+# 导入基本面分析模块和数据源适配层
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fundamental_analyzer import FundamentalAnalyzer
+from data_source import DataSource
 
 
 class SimpleStockAnalyzer:
@@ -37,29 +38,21 @@ class SimpleStockAnalyzer:
         self.market_data = {}
 
     def fetch_data(self):
-        """获取股票数据（扩展至400天，支持MA120/MA250）"""
+        """获取股票数据（使用 baostock，扩展至400天，支持MA120/MA250）"""
         try:
             print(f"📊 正在获取 {self.stock_code} 的数据...")
 
             end_date = datetime.now()
             start_date = end_date - timedelta(days=400)
 
-            for attempt in range(3):
-                try:
-                    self.df = ak.stock_zh_a_hist(
-                        symbol=self.stock_code,
-                        period="daily",
-                        start_date=start_date.strftime('%Y%m%d'),
-                        end_date=end_date.strftime('%Y%m%d'),
-                        adjust="qfq"
-                    )
-                    if self.df is not None and not self.df.empty:
-                        break
-                    time.sleep(1)
-                except Exception as e:
-                    if attempt == 2:
-                        raise e
-                    time.sleep(2)
+            # 使用 baostock 获取日K线
+            self.df = DataSource.get_stock_hist(
+                stock_code=self.stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                adjust='qfq',
+                period='daily'
+            )
 
             if self.df is None or self.df.empty:
                 print(f"❌ 无法获取股票 {self.stock_code} 的历史数据")
@@ -67,12 +60,12 @@ class SimpleStockAnalyzer:
 
             # 获取周K线
             try:
-                self.df_weekly = ak.stock_zh_a_hist(
-                    symbol=self.stock_code,
-                    period="weekly",
-                    start_date=start_date.strftime('%Y%m%d'),
-                    end_date=end_date.strftime('%Y%m%d'),
-                    adjust="qfq"
+                self.df_weekly = DataSource.get_stock_hist(
+                    stock_code=self.stock_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust='qfq',
+                    period='weekly'
                 )
             except:
                 self.df_weekly = None
@@ -90,13 +83,11 @@ class SimpleStockAnalyzer:
                 'turnover': latest['换手率'] if '换手率' in latest else 0
             }
 
-            try:
-                stock_name = ak.stock_individual_info_em(symbol=self.stock_code)
-                if stock_name is not None and not stock_name.empty:
-                    name_row = stock_name[stock_name['item'] == '股票简称']
-                    if not name_row.empty:
-                        self.data['name'] = name_row['value'].values[0]
-            except:
+            # baostock 数据中已包含股票代码，可从中提取名称
+            # 但为了兼容性，仍保留从 code 列提取（如果有）
+            if 'code' in self.df.columns and not self.df.empty:
+                # baostock 返回的 code 格式如 'sh.600519'
+                # 名称需要单独查询，暂时保持默认
                 pass
 
             self.calculate_indicators()
@@ -111,37 +102,23 @@ class SimpleStockAnalyzer:
             return False
 
     def fetch_market_data(self):
-        """获取市场数据"""
+        """获取市场数据（使用 baostock）"""
         try:
-            for attempt in range(2):
-                try:
-                    sz_index = ak.stock_zh_index_daily(symbol="sh000001")
-                    if sz_index is not None and not sz_index.empty:
-                        latest_sz = sz_index.iloc[-1]
-                        prev_sz = sz_index.iloc[-2]
-                        self.market_data['上证指数'] = {
-                            'price': latest_sz['close'],
-                            'change_pct': ((latest_sz['close'] - prev_sz['close']) / prev_sz['close']) * 100
-                        }
-                        break
-                except:
-                    time.sleep(1)
-
+            # 获取上证指数
             try:
-                stock_info = ak.stock_individual_info_em(symbol=self.stock_code)
-                if stock_info is not None and not stock_info.empty:
-                    industry_row = stock_info[stock_info['item'] == '行业']
-                    if not industry_row.empty:
-                        industry_name = industry_row['value'].values[0]
-                        sectors = ak.stock_board_industry_name_em()
-                        industry_data = sectors[sectors['板块名称'] == industry_name]
-                        if not industry_data.empty:
-                            self.market_data['行业'] = {
-                                'name': industry_name,
-                                'change_pct': industry_data.iloc[0]['涨跌幅']
-                            }
+                sz_df = DataSource.get_stock_hist('000001', period='daily')
+                if sz_df is not None and not sz_df.empty and len(sz_df) >= 2:
+                    latest_sz = sz_df.iloc[-1]
+                    prev_sz = sz_df.iloc[-2]
+                    self.market_data['上证指数'] = {
+                        'price': latest_sz['收盘'],
+                        'change_pct': ((latest_sz['收盘'] - prev_sz['收盘']) / prev_sz['收盘']) * 100
+                    }
             except:
                 pass
+
+            # 行业数据暂时无法从 baostock 获取，跳过
+            # 可以考虑从其他数据源补充，或者不显示行业数据
         except:
             pass
 

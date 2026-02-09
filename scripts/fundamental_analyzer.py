@@ -9,6 +9,15 @@
 - 财务健康: 10分（资产负债率、流动比率、现金流）
 - 估值水平: 10分（PE、机构参与度、排名）
 - 资金面:   5分（主力资金流向、股东户数变化）
+
+数据源说明：
+- 基本面数据仍使用 akshare（baostock 不提供基本面数据）
+- 如遇频繁限流，建议降低调用频率或等待1-2小时后重试
+
+优化策略：
+- 缓存机制减少重复查询
+- 容错处理，部分数据缺失不影响整体分析
+- 轻量级评分模式（仅查询核心指标）
 """
 
 import akshare as ak
@@ -17,12 +26,40 @@ import numpy as np
 from datetime import datetime, timedelta
 import warnings
 import time
+import hashlib
 
 warnings.filterwarnings('ignore')
 
 
+# 全局缓存（避免重复查询）
+_FUNDAMENTAL_CACHE = {}
+_CACHE_TTL = 600  # 缓存10分钟
+
+
+def _get_cache_key(*args, **kwargs):
+    """生成缓存键"""
+    key_str = str(args) + str(sorted(kwargs.items()))
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+
+def _get_cache(key):
+    """获取缓存"""
+    if key in _FUNDAMENTAL_CACHE:
+        data, timestamp = _FUNDAMENTAL_CACHE[key]
+        if time.time() - timestamp < _CACHE_TTL:
+            return data
+        else:
+            del _FUNDAMENTAL_CACHE[key]
+    return None
+
+
+def _set_cache(key, data):
+    """设置缓存"""
+    _FUNDAMENTAL_CACHE[key] = (data, time.time())
+
+
 class FundamentalAnalyzer:
-    """基本面分析器 — 内功评估"""
+    """基本面分析器 — 内功评估（带缓存优化）"""
 
     def __init__(self, stock_code, stock_name=None):
         self.stock_code = stock_code
@@ -35,6 +72,7 @@ class FundamentalAnalyzer:
         self.scores = {}                # 各维度得分
         self.details = {}               # 各维度详情
         self._fetch_errors = []         # 数据获取错误记录
+        self._use_cache = True          # 是否使用缓存
 
     def fetch_all_data(self):
         """获取所有基本面数据"""
@@ -44,7 +82,14 @@ class FundamentalAnalyzer:
         self.fetch_shareholder_data()
 
     def fetch_financial_data(self):
-        """获取财务分析指标（最近3年）"""
+        """获取财务分析指标（最近3年，带缓存）"""
+        if self._use_cache:
+            cache_key = _get_cache_key('financial', self.stock_code)
+            cached = _get_cache(cache_key)
+            if cached is not None:
+                self.financial_data = cached
+                return
+        
         try:
             start_year = str(datetime.now().year - 3)
             df = ak.stock_financial_analysis_indicator(
@@ -52,6 +97,8 @@ class FundamentalAnalyzer:
             )
             if df is not None and not df.empty:
                 self.financial_data = df
+                if self._use_cache:
+                    _set_cache(cache_key, df)
         except Exception as e:
             self._fetch_errors.append(f"财务指标: {e}")
 

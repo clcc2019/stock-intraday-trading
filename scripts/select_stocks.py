@@ -10,7 +10,6 @@
 - 逆小势：标注钟摆回摆至均线附近的最佳做T候选
 """
 
-import akshare as ak
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -22,9 +21,10 @@ import sys
 
 warnings.filterwarnings('ignore')
 
-# 导入基本面分析模块
+# 导入基本面分析模块和数据源适配层
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fundamental_analyzer import FundamentalAnalyzer
+from data_source import DataSource
 
 
 class TrendStockSelector:
@@ -52,12 +52,12 @@ class TrendStockSelector:
             return []
 
     def _get_index_stocks(self):
-        """获取指数成分股"""
+        """获取指数成分股（使用 baostock）"""
         index_map = {
-            'hs300': ('沪深300', lambda: ak.index_stock_cons_csindex(symbol="000300")),
-            'zz500': ('中证500', lambda: ak.index_stock_cons_csindex(symbol="000905")),
-            'sz50': ('上证50', lambda: ak.index_stock_cons_csindex(symbol="000016")),
-            'zz1000': ('中证1000', lambda: ak.index_stock_cons_csindex(symbol="000852")),
+            'hs300': ('沪深300', 'sh.000300'),
+            'zz500': ('中证500', 'sh.000905'),
+            'sz50': ('上证50', 'sh.000016'),
+            'zz1000': ('中证1000', 'sh.000852'),
         }
 
         key = self.index.lower()
@@ -66,36 +66,16 @@ class TrendStockSelector:
             print("将使用沪深300")
             key = 'hs300'
 
-        name, fetch_fn = index_map[key]
+        name, index_code = index_map[key]
         print(f"📊 从{name}成分股中选股...")
 
         try:
-            df = fetch_fn()
+            df = DataSource.get_index_stocks(index_code)
             if df is not None and not df.empty:
-                # 尝试提取 code -> name 映射
-                code_col, name_col = None, None
-                for cc in ['成分券代码', '证券代码', 'symbol', '代码']:
-                    if cc in df.columns:
-                        code_col = cc
-                        break
-                for nc in ['成分券名称', '证券名称', '名称', 'name']:
-                    if nc in df.columns:
-                        name_col = nc
-                        break
-
-                if code_col:
-                    codes = df[code_col].astype(str).tolist()
-                    codes = [c.zfill(6) for c in codes if len(c.strip()) >= 6 or c.strip().isdigit()]
-                    # 构建名称映射
-                    if name_col:
-                        for _, row in df.iterrows():
-                            c = str(row[code_col]).zfill(6)
-                            self.stock_names[c] = str(row[name_col])
-                    print(f"✅ 获取到 {len(codes)} 只成分股")
-                    return codes
-                # 如果没找到列名，尝试第一列
-                codes = df.iloc[:, 0].astype(str).tolist()
-                codes = [c.zfill(6) for c in codes if c.strip().isdigit()]
+                codes = df['代码'].astype(str).tolist()
+                # 构建名称映射
+                for _, row in df.iterrows():
+                    self.stock_names[row['代码']] = row['名称']
                 print(f"✅ 获取到 {len(codes)} 只成分股")
                 return codes
         except Exception as e:
@@ -106,105 +86,42 @@ class TrendStockSelector:
         return self._get_all_a_stocks()[:300]
 
     def _get_sector_stocks(self):
-        """获取板块成分股"""
-        print(f"📊 从{self.sector}板块中选股...")
-        try:
-            # 获取行业板块成分股
-            df = ak.stock_board_industry_cons_em(symbol=self.sector)
-            if df is not None and not df.empty:
-                for col in ['代码', 'symbol', '证券代码']:
-                    if col in df.columns:
-                        codes = df[col].astype(str).tolist()
-                        codes = [c.zfill(6) for c in codes]
-                        print(f"✅ 获取到 {len(codes)} 只板块成分股")
-                        return codes
-        except Exception as e:
-            print(f"⚠️ 获取板块成分股失败: {e}，尝试概念板块...")
-
-        try:
-            df = ak.stock_board_concept_cons_em(symbol=self.sector)
-            if df is not None and not df.empty:
-                for col in ['代码', 'symbol', '证券代码']:
-                    if col in df.columns:
-                        codes = df[col].astype(str).tolist()
-                        codes = [c.zfill(6) for c in codes]
-                        print(f"✅ 获取到 {len(codes)} 只概念板块成分股")
-                        return codes
-        except Exception as e:
-            print(f"❌ 板块 '{self.sector}' 未找到: {e}")
-            return []
+        """获取板块成分股（baostock 不支持板块，使用全市场）"""
+        print(f"⚠️ baostock 不支持板块筛选，将从全市场选股...")
+        return self._get_all_a_stocks()
 
         return []
 
     def _get_all_a_stocks(self):
-        """获取全A股列表"""
+        """获取全A股列表（使用 baostock）"""
         print("📊 获取全A股列表（较慢，建议使用 --index hs300）...")
         try:
-            df = ak.stock_zh_a_spot_em()
+            df = DataSource.get_stock_list()
             if df is not None and not df.empty:
-                # 过滤ST和退市股
-                df = df[~df['名称'].str.contains('ST|退市', na=False)]
-                # 过滤北交所（代码8/9开头）
-                df = df[~df['代码'].str.startswith(('8', '9', '4'))]
                 codes = df['代码'].tolist()
+                # 构建名称映射
+                for _, row in df.iterrows():
+                    self.stock_names[row['代码']] = row['名称']
                 print(f"✅ 获取到 {len(codes)} 只A股")
                 return codes
         except Exception as e:
             print(f"❌ 获取A股列表失败: {e}")
             return []
 
-    # 类变量：记录东方财富API是否可用，避免反复超时
-    _eastmoney_available = None  # None=未检测, True=可用, False=不可用
-
     def _fetch_stock_data(self, stock_code, days=400):
-        """获取股票数据（智能选择数据源，避免反复超时）"""
+        """获取股票数据（使用 baostock）"""
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
 
-        # 方法1: 东方财富 stock_zh_a_hist（仅在未确认不可用时尝试）
-        if TrendStockSelector._eastmoney_available is not False:
-            try:
-                df = ak.stock_zh_a_hist(
-                    symbol=stock_code,
-                    period="daily",
-                    start_date=start_date.strftime('%Y%m%d'),
-                    end_date=end_date.strftime('%Y%m%d'),
-                    adjust="qfq"
-                )
-                if df is not None and not df.empty:
-                    TrendStockSelector._eastmoney_available = True
-                    return df
-            except Exception:
-                if TrendStockSelector._eastmoney_available is None:
-                    print("   ⚠ 东方财富数据源不可用，切换备用数据源（网易财经）...")
-                TrendStockSelector._eastmoney_available = False
-
-        # 方法2: 备用数据源 stock_zh_a_daily（网易财经）
         try:
-            if stock_code.startswith('6'):
-                symbol = f'sh{stock_code}'
-            elif stock_code.startswith(('0', '3')):
-                symbol = f'sz{stock_code}'
-            else:
-                symbol = f'sh{stock_code}'
-
-            df = ak.stock_zh_a_daily(
-                symbol=symbol,
-                start_date=start_date.strftime('%Y%m%d'),
-                end_date=end_date.strftime('%Y%m%d'),
-                adjust="qfq"
+            df = DataSource.get_stock_hist(
+                stock_code=stock_code,
+                start_date=start_date,
+                end_date=end_date,
+                adjust='qfq',
+                period='daily'
             )
             if df is not None and not df.empty:
-                col_map = {
-                    'date': '日期', 'open': '开盘', 'high': '最高',
-                    'low': '最低', 'close': '收盘', 'volume': '成交量',
-                    'amount': '成交额', 'turnover': '换手率',
-                    'outstanding_share': '流通股本',
-                }
-                df = df.rename(columns=col_map)
-                if '日期' in df.columns:
-                    df['日期'] = df['日期'].astype(str)
-                df = df.reset_index(drop=True)
                 return df
         except Exception:
             pass
