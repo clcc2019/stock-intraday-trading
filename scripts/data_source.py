@@ -21,8 +21,14 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import hashlib
+import os
+import pickle
 
 warnings.filterwarnings('ignore')
+
+# 磁盘缓存目录（当日有效）
+_DISK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache')
+os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
 
 # 延迟导入 adata（可选依赖）
 _adata = None
@@ -107,6 +113,53 @@ class DataSource:
         ]
         for k in expired_keys:
             del cls._cache[k]
+    
+    # ============================================================
+    # 磁盘缓存：日K线当日只需获取一次，大幅减少网络请求
+    # ============================================================
+    
+    @classmethod
+    def _disk_cache_path(cls, category, key):
+        """生成磁盘缓存文件路径（按日期分目录）"""
+        today = datetime.now().strftime('%Y%m%d')
+        day_dir = os.path.join(_DISK_CACHE_DIR, today)
+        os.makedirs(day_dir, exist_ok=True)
+        safe_key = key.replace('/', '_').replace('.', '_')
+        return os.path.join(day_dir, f'{category}_{safe_key}.pkl')
+    
+    @classmethod
+    def _get_disk_cache(cls, category, key):
+        """读取磁盘缓存（当日有效）"""
+        path = cls._disk_cache_path(category, key)
+        if os.path.exists(path):
+            try:
+                with open(path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
+        return None
+    
+    @classmethod
+    def _set_disk_cache(cls, category, key, data):
+        """写入磁盘缓存"""
+        path = cls._disk_cache_path(category, key)
+        try:
+            with open(path, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception:
+            pass
+    
+    @classmethod
+    def cleanup_old_disk_cache(cls, keep_days=3):
+        """清理过期的磁盘缓存（保留最近N天）"""
+        if not os.path.exists(_DISK_CACHE_DIR):
+            return
+        cutoff = datetime.now() - timedelta(days=keep_days)
+        cutoff_str = cutoff.strftime('%Y%m%d')
+        for d in os.listdir(_DISK_CACHE_DIR):
+            if d < cutoff_str and os.path.isdir(os.path.join(_DISK_CACHE_DIR, d)):
+                import shutil
+                shutil.rmtree(os.path.join(_DISK_CACHE_DIR, d), ignore_errors=True)
     
     @classmethod
     def _convert_code(cls, stock_code):
@@ -225,22 +278,30 @@ class DataSource:
         返回:
             DataFrame，列名与 akshare 兼容：日期、开盘、最高、最低、收盘、成交量、成交额、换手率
         """
-        # 检查缓存
+        # 1) 内存缓存
         cache_key = cls._get_cache_key('hist', stock_code, start_date, end_date, adjust, period)
         cached = cls._get_cache(cache_key)
         if cached is not None:
             return cached.copy()
         
-        # 尝试 baostock（主数据源）
+        # 2) 磁盘缓存（日K线当日有效，大幅减少重复请求）
+        disk_key = f'{stock_code}_{start_date}_{end_date}_{adjust}_{period}'
+        disk_cached = cls._get_disk_cache('hist', disk_key)
+        if disk_cached is not None:
+            cls._set_cache(cache_key, disk_cached)  # 回填内存缓存
+            return disk_cached.copy()
+        
+        # 3) 网络请求 — baostock（主数据源）
         try:
             df = cls._get_stock_hist_baostock(stock_code, start_date, end_date, adjust, period)
             if df is not None and not df.empty:
                 cls._set_cache(cache_key, df)
+                cls._set_disk_cache('hist', disk_key, df)  # 写入磁盘缓存
                 return df
         except Exception as e:
             print(f"   ⚠ baostock 获取失败，尝试备用数据源...")
         
-        # 降级到 akshare（备用数据源）
+        # 4) 降级到 akshare（备用数据源）
         if cls._akshare_available is not False:
             try:
                 import akshare as ak
@@ -248,6 +309,7 @@ class DataSource:
                 if df is not None and not df.empty:
                     cls._akshare_available = True
                     cls._set_cache(cache_key, df)
+                    cls._set_disk_cache('hist', disk_key, df)
                     return df
             except Exception as e:
                 cls._akshare_available = False
@@ -426,6 +488,12 @@ class DataSource:
         if cached is not None:
             return cached.copy()
         
+        # 磁盘缓存（指数成分股当日不变）
+        disk_cached = cls._get_disk_cache('index', index_code)
+        if disk_cached is not None:
+            cls._set_cache(cache_key, disk_cached)
+            return disk_cached.copy()
+        
         cls.login()
         
         # 根据指数代码选择正确的 baostock API
@@ -464,6 +532,7 @@ class DataSource:
         })
         
         cls._set_cache(cache_key, result)
+        cls._set_disk_cache('index', index_code, result)
         return result
     
     @classmethod

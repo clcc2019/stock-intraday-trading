@@ -276,56 +276,113 @@ def analyze_ma_alignment(latest, price):
 
 def calculate_pendulum(price, ma_values):
     """
-    钟摆位置分析（均线偏离度）
+    多级别钟摆位置分析（均线偏离度）
 
     参数:
         price: 当前价格
-        ma_values: dict, 各均线值 {'MA20': x, 'MA60': x, ...}
+        ma_values: dict, 各均线值 {'MA5': x, 'MA10': x, 'MA20': x, 'MA60': x, ...}
 
     返回:
         dict: {
-            'MA20': {'value': x, 'deviation': x, 'phase': str},
+            'MA5': {'value': x, 'deviation': x, 'phase': str},
+            'MA10': {...},
+            'MA20': {...},
             'MA60': {...},
             ...
-            'overall': str,  # 综合判断
+            'short_term': str,   # 短期钟摆（MA5/MA10）
+            'mid_term': str,     # 中期钟摆（MA20）
+            'overall': str,      # 综合判断
         }
     """
     result = {}
 
-    for ma_name in ['MA20', 'MA60', 'MA120', 'MA250']:
+    # 短期均线用更小的阈值
+    short_thresholds = {'MA5': (3, 5, 8), 'MA10': (4, 6, 10)}  # (略高, 偏高, 极度)
+    # 中长期均线用标准阈值
+    long_thresholds = {'MA20': (5, 8, 12), 'MA60': (8, 15, 20), 'MA120': (10, 15, 25), 'MA250': (15, 20, 30)}
+
+    all_thresholds = {**short_thresholds, **long_thresholds}
+
+    for ma_name in ['MA5', 'MA10', 'MA20', 'MA60', 'MA120', 'MA250']:
         ma_val = ma_values.get(ma_name)
         if ma_val is None or ma_val == 0:
             result[ma_name] = {'value': None, 'deviation': None, 'phase': '数据不足'}
             continue
 
         dev = (price - ma_val) / ma_val * 100
+        t_high, t_very_high, t_extreme = all_thresholds.get(ma_name, (5, 10, 15))
 
-        if dev > 15:
+        if dev > t_extreme:
             phase = '极度偏高（绳子极紧，回归压力大）'
-        elif dev > 10:
+        elif dev > t_very_high:
             phase = '偏高（注意回归压力）'
-        elif dev > 5:
+        elif dev > t_high:
             phase = '略高'
         elif dev > -2:
             phase = '中枢附近（适合做T）'
-        elif dev > -5:
+        elif dev > -t_high:
             phase = '略低'
-        elif dev > -10:
+        elif dev > -t_very_high:
             phase = '偏低（回归动力增强）'
         else:
             phase = '极度偏低（绳子极紧，反弹动力大）'
 
         result[ma_name] = {'value': ma_val, 'deviation': dev, 'phase': phase}
 
-    # 综合钟摆阶段
+    # 短期钟摆判断（MA5/MA10联合）
+    dev_ma5 = result.get('MA5', {}).get('deviation')
+    dev_ma10 = result.get('MA10', {}).get('deviation')
+    if dev_ma5 is not None and dev_ma10 is not None:
+        if dev_ma5 <= 1 and dev_ma10 <= 2:
+            short_term = '短期均线收敛（安全）'
+        elif dev_ma5 > 5 or dev_ma10 > 4:
+            short_term = '短期过热（注意回调风险）'
+        elif dev_ma5 < -3 or dev_ma10 < -3:
+            short_term = '短期超跌（反弹动力强）'
+        else:
+            short_term = '短期中性'
+    else:
+        short_term = '数据不足'
+    result['short_term'] = short_term
+
+    # 中期钟摆判断（MA20）
     dev_ma20 = result.get('MA20', {}).get('deviation')
     if dev_ma20 is not None:
         if abs(dev_ma20) <= 3:
-            overall = '钟摆在中枢附近，适合做T'
+            mid_term = '钟摆在中枢附近，适合做T'
+        elif dev_ma20 > 8:
+            mid_term = '钟摆严重偏高，追高风险大'
         elif dev_ma20 > 5:
-            overall = '钟摆偏高，做T以卖出为主'
+            mid_term = '钟摆偏高，做T以卖出为主'
+        elif dev_ma20 < -8:
+            mid_term = '钟摆严重偏低，反弹动力大'
         elif dev_ma20 < -5:
-            overall = '钟摆偏低，做T以买入为主'
+            mid_term = '钟摆偏低，做T以买入为主'
+        else:
+            mid_term = '钟摆在中间区域'
+    else:
+        mid_term = '数据不足'
+    result['mid_term'] = mid_term
+
+    # 综合判断（短期+中期联合）
+    if dev_ma20 is not None and dev_ma5 is not None:
+        if abs(dev_ma20) <= 3 and dev_ma5 <= 1:
+            overall = '均线簇收敛，最佳买点'
+        elif abs(dev_ma20) <= 3:
+            overall = '接近中枢，可考虑做T'
+        elif dev_ma20 > 5 and dev_ma5 > 3:
+            overall = '多级别过热，建议等待回踩'
+        elif dev_ma20 < -5 and dev_ma5 < -2:
+            overall = '多级别超跌，关注反弹机会'
+        else:
+            overall = '钟摆在中间区域'
+    elif dev_ma20 is not None:
+        if abs(dev_ma20) <= 3:
+            overall = '钟摆在中枢附近'
+        elif dev_ma20 > 5:
+            overall = '钟摆偏高，建议等待回踩'
+        elif dev_ma20 < -5:
+            overall = '钟摆偏低，关注反弹'
         else:
             overall = '钟摆在中间区域'
     else:

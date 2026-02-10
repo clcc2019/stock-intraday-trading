@@ -219,17 +219,31 @@ class SimpleStockAnalyzer:
         signals['indicators']['趋势方向'] = f'{trend_status} {"/".join(trend_details)}'
 
         # ============================================================
-        # 核心维度2: 钟摆位置/均线偏离度（满分5分，权重25%）
+        # 核心维度2: 多级别钟摆位置/均线偏离度（满分5分，权重25%）
+        # MA5=超短期情绪, MA10=短期情绪, MA20=中期中枢, MA60=季度趋势
         # ============================================================
         pendulum_buy = 0
         pendulum_sell = 0
         pendulum_details = []
 
+        dev_ma5 = (current_price - ma5) / ma5 * 100 if not np.isnan(ma5) else 0
+        dev_ma10 = (current_price - ma10) / ma10 * 100 if not np.isnan(ma10) else 0
         dev_ma20 = (current_price - ma20) / ma20 * 100 if not np.isnan(ma20) else 0
         dev_ma60 = (current_price - ma60) / ma60 * 100 if has_ma60 else 0
         dev_ma120 = (current_price - ma120) / ma120 * 100 if has_ma120 else 0
 
-        # MA20偏离度评分
+        # --- 短期钟摆（MA5/MA10联合判断）---
+        if dev_ma5 <= 1 and dev_ma10 <= 2:
+            pendulum_buy += 1  # 短期均线收敛，安全
+            pendulum_details.append(f'短期均线收敛(MA5:{dev_ma5:+.1f}%/MA10:{dev_ma10:+.1f}%)')
+        elif dev_ma5 > 5 and dev_ma10 > 4:
+            pendulum_sell += 1  # 短期过热
+            pendulum_details.append(f'短期过热(MA5:{dev_ma5:+.1f}%/MA10:{dev_ma10:+.1f}%)')
+        elif dev_ma5 < -3 and dev_ma10 < -2:
+            pendulum_buy += 1  # 短期超跌
+            pendulum_details.append(f'短期超跌(MA5:{dev_ma5:+.1f}%/MA10:{dev_ma10:+.1f}%)')
+
+        # --- 中期钟摆（MA20）---
         if -3 <= dev_ma20 <= 3:
             pendulum_buy += 2  # 中枢附近，适合买入
             pendulum_details.append(f'MA20中枢附近({dev_ma20:+.1f}%)')
@@ -248,7 +262,7 @@ class SimpleStockAnalyzer:
             pendulum_buy += 1
             pendulum_details.append(f'MA20偏低({dev_ma20:+.1f}%)')
 
-        # MA60偏离度评分
+        # --- 季度钟摆（MA60）---
         if has_ma60:
             if dev_ma60 > 15:
                 pendulum_sell += 2
@@ -549,6 +563,8 @@ class SimpleStockAnalyzer:
                 'trend_sell': trend_sell,
                 'is_uptrend': is_uptrend,
                 'is_downtrend': is_downtrend,
+                'dev_ma5': dev_ma5,
+                'dev_ma10': dev_ma10,
                 'dev_ma20': dev_ma20,
                 'dev_ma60': dev_ma60,
                 'dev_ma120': dev_ma120,
@@ -614,14 +630,16 @@ class SimpleStockAnalyzer:
             print(f"均线值: {ma_str}")
 
         # 钟摆位置
-        print("\n━━━ 钟摆位置（均线偏离度）━━━")
+        print("\n━━━ 多级别钟摆位置（均线偏离度）━━━")
         print(f"{result['signals']['indicators']['钟摆位置']}")
-        dev_str = f"偏离MA20:{trend['dev_ma20']:+.1f}%"
+        dev_short = f"短期: MA5:{trend['dev_ma5']:+.1f}% MA10:{trend['dev_ma10']:+.1f}%"
+        dev_mid = f"中期: MA20:{trend['dev_ma20']:+.1f}%"
         if trend['dev_ma60'] != 0:
-            dev_str += f" 偏离MA60:{trend['dev_ma60']:+.1f}%"
+            dev_mid += f" MA60:{trend['dev_ma60']:+.1f}%"
         if trend['dev_ma120'] != 0:
-            dev_str += f" 偏离MA120:{trend['dev_ma120']:+.1f}%"
-        print(f"偏离度: {dev_str}")
+            dev_mid += f" MA120:{trend['dev_ma120']:+.1f}%"
+        print(f"偏离度 {dev_short}")
+        print(f"偏离度 {dev_mid}")
 
         # 量价关系
         print("\n━━━ 量价关系 ━━━")
