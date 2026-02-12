@@ -457,3 +457,281 @@ def calculate_trend_strength(latest, df, price):
 
     strength = min(10, strength)
     return {'score': strength, 'details': details}
+
+
+def detect_topping_signals(df, price=None):
+    """
+    检测行情见顶/主力出货信号
+
+    核心场景：MA20仍在向上（看起来趋势还好），但短期已经开始转弱。
+    需要识别"趋势末端"的典型特征，避免在行情结束时还误判为买入机会。
+
+    检测维度（每个维度独立打分，总分越高见顶概率越大）：
+    1. 短期均线拐头：MA5 连续下行，MA5下穿MA10（短线走弱）
+    2. 连续阴线：近N日阴线比例高，说明卖压持续
+    3. 量价背离：价格创新高但成交量萎缩（拉高出货的经典特征）
+    4. 高位放量滞涨：大量成交但价格不涨（主力对倒出货）
+    5. MACD顶背离：价格创新高但DIF走低
+    6. 高位长上影线：说明上方抛压重
+    7. MA5/MA10 死叉且远离MA20：短期趋势已经反转
+
+    参数:
+        df: DataFrame，需包含 '收盘'/'开盘'/'最高'/'最低'/'成交量' 以及均线列
+        price: 当前价格（可选，默认取最新收盘价）
+
+    返回:
+        dict: {
+            'score': int,           # 见顶信号强度（0-100），>= 50 需要警惕，>= 70 高概率见顶
+            'signals': list[str],   # 触发的信号列表
+            'level': str,           # '安全' / '注意' / '警惕' / '危险'
+            'is_topping': bool,     # 是否判定为见顶（score >= 50）
+            'details': dict,        # 各维度详细数据
+        }
+    """
+    if len(df) < 30:
+        return {'score': 0, 'signals': [], 'level': '数据不足', 'is_topping': False, 'details': {}}
+
+    latest = df.iloc[-1]
+    if price is None:
+        price = latest['收盘']
+
+    score = 0
+    signals = []
+    details = {}
+
+    # ------------------------------------------------------------------
+    # 1. 短期均线拐头下行（最大20分）
+    # MA5 连续下行 = 短线资金撤离
+    # ------------------------------------------------------------------
+    ma5_vals = df['MA5'].tail(5).tolist()
+    ma5_consecutive_down = 0
+    for i in range(len(ma5_vals) - 1, 0, -1):
+        if not (np.isnan(ma5_vals[i]) or np.isnan(ma5_vals[i-1])):
+            if ma5_vals[i] < ma5_vals[i-1]:
+                ma5_consecutive_down += 1
+            else:
+                break
+
+    ma5_turning = ma5_consecutive_down >= 2
+    ma5_score = 0
+    if ma5_consecutive_down >= 3:
+        ma5_score = 20
+        signals.append(f'MA5连续{ma5_consecutive_down}日下行（短线资金持续撤离）')
+    elif ma5_consecutive_down >= 2:
+        ma5_score = 12
+        signals.append(f'MA5连续{ma5_consecutive_down}日下行')
+
+    # MA5下穿MA10（短线死叉）
+    ma5 = _safe_ma(latest, 'MA5')
+    ma10 = _safe_ma(latest, 'MA10')
+    prev = df.iloc[-2]
+    if ma5 is not None and ma10 is not None:
+        prev_ma5 = _safe_ma(prev, 'MA5')
+        prev_ma10 = _safe_ma(prev, 'MA10')
+        if prev_ma5 is not None and prev_ma10 is not None:
+            if ma5 < ma10 and prev_ma5 >= prev_ma10:
+                ma5_score = min(20, ma5_score + 10)
+                signals.append('MA5下穿MA10（短线死叉）')
+            elif ma5 < ma10:
+                ma5_score = min(20, ma5_score + 5)
+
+    score += ma5_score
+    details['ma5_turning'] = {'consecutive_down': ma5_consecutive_down, 'score': ma5_score}
+
+    # ------------------------------------------------------------------
+    # 2. 连续阴线（最大15分）
+    # 近5日阴线比例高 = 卖压持续
+    # ------------------------------------------------------------------
+    recent_5 = df.tail(5)
+    down_days = sum(1 for _, row in recent_5.iterrows() if row['收盘'] < row['开盘'])
+    down_pct_days = sum(1 for _, row in recent_5.iterrows()
+                        if row['收盘'] < df.iloc[max(0, df.index.get_loc(row.name) - 1)]['收盘'])
+
+    consecutive_down = 0
+    for i in range(len(df) - 1, max(len(df) - 6, 0), -1):
+        if df.iloc[i]['收盘'] < df.iloc[i]['开盘']:
+            consecutive_down += 1
+        else:
+            break
+
+    candle_score = 0
+    if consecutive_down >= 4:
+        candle_score = 15
+        signals.append(f'连续{consecutive_down}根阴线（卖压极强）')
+    elif consecutive_down >= 3:
+        candle_score = 10
+        signals.append(f'连续{consecutive_down}根阴线（持续卖压）')
+    elif down_days >= 4:
+        candle_score = 8
+        signals.append(f'近5日{down_days}阴（卖压偏重）')
+
+    score += candle_score
+    details['candle'] = {'consecutive_down': consecutive_down, 'down_5d': down_days, 'score': candle_score}
+
+    # ------------------------------------------------------------------
+    # 3. 量价背离（最大20分）
+    # 价格在近期高位，但成交量逐步萎缩 = 上涨动能衰竭
+    # ------------------------------------------------------------------
+    vp_score = 0
+
+    # 检查近20日是否有价格高点
+    recent_20 = df.tail(20)
+    high_20d = recent_20['最高'].max()
+    price_near_high = (high_20d - price) / high_20d * 100 < 3  # 距20日最高点3%以内
+
+    if price_near_high and len(df) >= 20:
+        # 比较前10日平均量和后10日平均量
+        vol_first_half = df.iloc[-20:-10]['成交量'].mean()
+        vol_second_half = df.iloc[-10:]['成交量'].mean()
+        if vol_first_half > 0:
+            vol_ratio = vol_second_half / vol_first_half
+            if vol_ratio < 0.6:
+                vp_score = 20
+                signals.append(f'高位量价背离（量能萎缩{(1-vol_ratio)*100:.0f}%，拉高出货风险）')
+            elif vol_ratio < 0.75:
+                vp_score = 12
+                signals.append(f'量能逐步萎缩（后半段量比前半段缩{(1-vol_ratio)*100:.0f}%）')
+            details['volume_divergence'] = {'vol_ratio': vol_ratio}
+
+    # 缩量创新高（更危险的信号）
+    if len(df) >= 5:
+        recent_high = df.tail(5)['最高'].max()
+        prev_high = df.tail(20).head(15)['最高'].max() if len(df) >= 20 else 0
+        recent_vol = df.tail(5)['成交量'].mean()
+        prev_vol = df.tail(20).head(15)['成交量'].mean() if len(df) >= 20 else recent_vol
+        if recent_high > prev_high and prev_vol > 0 and recent_vol / prev_vol < 0.7:
+            vp_score = min(20, vp_score + 8)
+            if '量价背离' not in ' '.join(signals):
+                signals.append('缩量创新高（上涨动能不足）')
+
+    score += vp_score
+    details['volume_price'] = {'score': vp_score, 'near_high': price_near_high}
+
+    # ------------------------------------------------------------------
+    # 4. 高位放量滞涨 / 放量下跌（最大15分）
+    # 放量但价格不涨甚至下跌 = 主力对倒出货
+    # ------------------------------------------------------------------
+    stagnation_score = 0
+    if 'VOL_MA5' in latest and latest['VOL_MA5'] > 0:
+        vol_ratio = latest['成交量'] / latest['VOL_MA5']
+        today_change = (latest['收盘'] - latest['开盘']) / latest['开盘'] * 100
+
+        # 放量下跌
+        if vol_ratio > 1.5 and today_change < -1:
+            stagnation_score = 15
+            signals.append(f'放量下跌（量比{vol_ratio:.1f}，跌{today_change:.1f}%，主力出货特征）')
+        elif vol_ratio > 1.3 and today_change < -0.5:
+            stagnation_score = 10
+            signals.append(f'放量阴线（量比{vol_ratio:.1f}，跌{today_change:.1f}%）')
+
+        # 近3日放量滞涨
+        if stagnation_score == 0 and len(df) >= 3:
+            recent_3 = df.tail(3)
+            avg_vol_3d = recent_3['成交量'].mean()
+            avg_vol_20d = df.tail(20)['成交量'].mean() if len(df) >= 20 else avg_vol_3d
+            price_change_3d = (price - df.iloc[-4]['收盘']) / df.iloc[-4]['收盘'] * 100 if len(df) >= 4 else 0
+            if avg_vol_20d > 0 and avg_vol_3d / avg_vol_20d > 1.3 and abs(price_change_3d) < 1:
+                stagnation_score = 10
+                signals.append(f'近3日放量滞涨（量增价不涨，资金分歧）')
+
+    score += stagnation_score
+    details['stagnation'] = {'score': stagnation_score}
+
+    # ------------------------------------------------------------------
+    # 5. MACD顶背离（最大15分）
+    # 价格创新高但DIF没有同步新高 = 动量衰减
+    # ------------------------------------------------------------------
+    divergence_score = 0
+    if 'DIF' in df.columns and len(df) >= 20:
+        # 找近20日价格高点和DIF高点
+        recent = df.tail(20)
+        price_highs = []
+        dif_at_price_highs = []
+
+        for i in range(2, len(recent) - 2):
+            row = recent.iloc[i]
+            if (row['最高'] >= recent.iloc[i-1]['最高'] and
+                row['最高'] >= recent.iloc[i-2]['最高'] and
+                row['最高'] >= recent.iloc[i+1]['最高'] and
+                row['最高'] >= recent.iloc[i+2]['最高']):
+                price_highs.append(row['最高'])
+                dif_at_price_highs.append(row['DIF'])
+
+        if len(price_highs) >= 2:
+            if price_highs[-1] >= price_highs[-2] and dif_at_price_highs[-1] < dif_at_price_highs[-2]:
+                divergence_score = 15
+                signals.append('MACD顶背离（价格新高但动量走弱，趋势可能反转）')
+
+    score += divergence_score
+    details['macd_divergence'] = {'score': divergence_score}
+
+    # ------------------------------------------------------------------
+    # 6. 高位长上影线（最大10分）
+    # 上影线长说明上方抛压重，是见顶的典型K线特征
+    # ------------------------------------------------------------------
+    shadow_score = 0
+    upper_shadow = latest['最高'] - max(latest['收盘'], latest['开盘'])
+    body = abs(latest['收盘'] - latest['开盘'])
+    total_range = latest['最高'] - latest['最低']
+
+    if total_range > 0:
+        shadow_ratio = upper_shadow / total_range
+        # 近3日出现长上影线
+        long_shadow_count = 0
+        for i in range(-3, 0):
+            if abs(i) <= len(df):
+                row = df.iloc[i]
+                r_total = row['最高'] - row['最低']
+                if r_total > 0:
+                    r_shadow = (row['最高'] - max(row['收盘'], row['开盘'])) / r_total
+                    if r_shadow > 0.5:
+                        long_shadow_count += 1
+
+        if long_shadow_count >= 2:
+            shadow_score = 10
+            signals.append(f'近3日出现{long_shadow_count}根长上影线（上方抛压重）')
+        elif shadow_ratio > 0.6 and total_range / price * 100 > 1:
+            shadow_score = 6
+            signals.append('今日长上影线（上方承压）')
+
+    score += shadow_score
+    details['upper_shadow'] = {'score': shadow_score}
+
+    # ------------------------------------------------------------------
+    # 7. MA5/MA10走平或死叉 + 远离MA20（最大5分）
+    # 短线已转弱但中线还在上行 = 趋势末端分歧
+    # ------------------------------------------------------------------
+    diverge_score = 0
+    ma20 = _safe_ma(latest, 'MA20')
+    if ma5 is not None and ma10 is not None and ma20 is not None and ma20 > 0:
+        dev_ma20 = (price - ma20) / ma20 * 100
+        if ma5 < ma10 and dev_ma20 > 5:
+            diverge_score = 5
+            signals.append(f'短线死叉但远离MA20({dev_ma20:+.1f}%)，趋势末端分歧')
+        elif ma5_turning and dev_ma20 > 3:
+            diverge_score = 3
+
+    score += diverge_score
+    details['short_long_diverge'] = {'score': diverge_score}
+
+    # ------------------------------------------------------------------
+    # 综合判定
+    # ------------------------------------------------------------------
+    score = min(100, score)
+
+    if score >= 70:
+        level = '危险'
+    elif score >= 50:
+        level = '警惕'
+    elif score >= 30:
+        level = '注意'
+    else:
+        level = '安全'
+
+    return {
+        'score': score,
+        'signals': signals,
+        'level': level,
+        'is_topping': score >= 50,
+        'details': details,
+    }

@@ -1,2 +1,2 @@
 scripts/.cache
-scripts/__pycache__/*
+__pycache__/

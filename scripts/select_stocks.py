@@ -30,7 +30,7 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fundamental_analyzer import FundamentalAnalyzer
 from data_source import DataSource
-from technical import calculate_ma, detect_highs_lows, analyze_ma_alignment, _safe_ma
+from technical import calculate_ma, calculate_macd, calculate_volume_ma, detect_highs_lows, analyze_ma_alignment, _safe_ma, detect_topping_signals
 
 
 class TrendStockSelector:
@@ -160,6 +160,8 @@ class TrendStockSelector:
 
             # 计算均线（使用公共模块）
             calculate_ma(df, windows=[5, 10, 20, 60, 120, 250])
+            calculate_volume_ma(df)
+            calculate_macd(df)
 
             latest = df.iloc[-1]
             price = latest['收盘']
@@ -193,6 +195,16 @@ class TrendStockSelector:
 
             # MA20必须向上
             if ma20_slope <= 0:
+                return None
+
+            # === 见顶/出货检测 ===
+            # 核心场景：MA20向上但短期已开始连续下跌
+            topping = detect_topping_signals(df, price)
+            topping_score = topping['score']
+            topping_level = topping['level']
+
+            # 见顶信号强烈的直接排除
+            if topping_score >= 70:
                 return None
 
             # === 多级别均线偏离度（钟摆位置）===
@@ -294,6 +306,11 @@ class TrendStockSelector:
             else:
                 ma_desc = '基本多头(MA5>10>20)'
 
+            # === 见顶信号降级做T标签 ===
+            if topping_score >= 50:
+                t0_label = '⚠️'  # 有见顶风险，不适合做T
+                pendulum = f'{pendulum}(见顶⚠)'
+
             # 基本面评分在两阶段筛选的第二阶段统一处理，此处先返回技术面结果
             result = {
                 'code': stock_code,
@@ -313,6 +330,9 @@ class TrendStockSelector:
                 'highs_rising': highs_rising,
                 'lows_rising': lows_rising,
                 'change_20d': change_20d,
+                'topping_score': topping_score,
+                'topping_level': topping_level,
+                'topping_signals': topping['signals'],
                 'fund_score': 0,
                 'fund_max': 10,
                 'combined_score': strength,  # 默认等于技术面强度，基本面在第二阶段补充
@@ -392,8 +412,11 @@ class TrendStockSelector:
 
         total = len(stock_pool)
         print(f"\n🔍 开始分析 {total} 只股票...")
-        print(f"   筛选条件: 均线多头排列 + MA20向上 + 多级别偏离度控制")
-        print(f"   过滤规则: MA60偏离>20% | MA20偏离>12% | MA5>7%且MA20>8% → 排除")
+        print(f"   筛选条件: 均线多头排列 + MA20向上 + 多级别偏离度控制 + 见顶检测")
+        print(f"   过滤规则: MA60偏离>20% | MA20偏离>12% | MA5>7%且MA20>8% | 见顶评分>=70 → 排除")
+
+        # 批量预加载当日实时行情（交易时段自动补充当日数据）
+        DataSource.preload_realtime_prices(stock_pool)
 
         # 两阶段筛选 + 并发获取
         results = self._batch_fetch_and_analyze(stock_pool)
@@ -469,6 +492,17 @@ class TrendStockSelector:
             for r in high_risk[:5]:
                 dev_str = f"MA5:{r['dev_ma5']:+.1f}% MA10:{r['dev_ma10']:+.1f}% MA20:{r['dev_ma20']:+.1f}%"
                 print(f"   ⚠️ {r['code']} {r['name']} ¥{r['price']:.2f} | {r['pendulum']} | {dev_str} | 建议等待回踩MA20后再介入")
+
+        # 见顶风险提示（MA20向上但短期转弱）
+        topping_risk = [r for r in top_results if r.get('topping_score', 0) >= 30]
+        if topping_risk:
+            print(f"\n━━━ 🔴 见顶/出货风险提示（MA20向上但短期出现转弱信号）━━━")
+            print(f"   ⚠️ 以下股票虽然MA20仍向上，但短期出现见顶/主力出货迹象\n")
+            for r in topping_risk[:10]:
+                level_emoji = '🔴' if r['topping_score'] >= 50 else '🟡'
+                print(f"   {level_emoji} {r['code']} {r['name']} ¥{r['price']:.2f} | 见顶评分:{r['topping_score']} ({r['topping_level']})")
+                for sig in r.get('topping_signals', [])[:3]:
+                    print(f"      → {sig}")
 
         # 内功提醒
         print(f"\n━━━ 内功提醒 ━━━")

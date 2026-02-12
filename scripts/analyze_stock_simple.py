@@ -27,6 +27,7 @@ from data_source import DataSource
 from technical import (
     calculate_all_indicators, detect_highs_lows,
     analyze_ma_alignment, calculate_pendulum, calculate_trend_strength,
+    detect_topping_signals,
 )
 
 
@@ -420,6 +421,28 @@ class SimpleStockAnalyzer:
         signals['indicators']['传统指标(参考)'] = f'{legacy_status} {"/".join(legacy_details)} (DIF:{latest["DIF"]:.3f} K:{k_value:.0f} J:{j_value:.0f})'
 
         # ============================================================
+        # 核心维度: 见顶/出货检测
+        # 场景：MA20向上但短期连续下跌，判断行情是否结束
+        # ============================================================
+        topping = detect_topping_signals(self.df, current_price)
+        topping_score = topping['score']
+
+        if topping_score >= 70:
+            signals['sell'] += 4
+            signals['key_signals'].append(f'🔴 见顶信号强烈（{topping_score}分）：行情可能已结束')
+        elif topping_score >= 50:
+            signals['sell'] += 3
+            signals['key_signals'].append(f'🟠 见顶信号明显（{topping_score}分）：需警惕主力出货')
+        elif topping_score >= 30:
+            signals['sell'] += 1
+            signals['key_signals'].append(f'🟡 出现见顶迹象（{topping_score}分）：关注后续走势')
+
+        for sig in topping['signals']:
+            signals['key_signals'].append(f'  → {sig}')
+
+        signals['indicators']['见顶检测'] = f"{'🔴 危险' if topping_score >= 70 else '🟠 警惕' if topping_score >= 50 else '🟡 注意' if topping_score >= 30 else '✅ 安全'}（{topping_score}分）"
+
+        # ============================================================
         # 市场环境调整
         # ============================================================
         market_adj = 0
@@ -538,6 +561,28 @@ class SimpleStockAnalyzer:
             position = '0%'
             advice = '⚠️ 趋势向下（均线空头排列），不建议买入'
 
+        # 见顶信号降级（核心：MA20向上但短期连续下跌）
+        if topping_score >= 70 and '买入' in action:
+            action = '🔴 卖出'
+            confidence = '高'
+            position = '50-70%'
+            advice = '⚠️ 见顶信号强烈，MA20虽向上但短期资金撤离明显，建议减仓'
+        elif topping_score >= 50 and '强烈买入' in action:
+            action = '⚪️ 观望'
+            confidence = '低'
+            position = '0%'
+            advice = '⚠️ 出现明显见顶信号，行情可能正在结束，不宜追买'
+        elif topping_score >= 50 and '买入' in action:
+            action = '⚪️ 观望'
+            confidence = '低'
+            position = '0%'
+            advice = '⚠️ 出现见顶信号（主力可能出货），等待确认后再操作'
+        elif topping_score >= 30 and '强烈买入' in action:
+            action = '🟡 可考虑买入'
+            confidence = '中'
+            position = '10-20%'
+            advice = '⚠️ 有见顶迹象，降低仓位观察'
+
         # 基本面极差降级
         if fundamental_score < 15 and '强烈买入' in action:
             action = '🟡 可考虑买入'
@@ -570,6 +615,12 @@ class SimpleStockAnalyzer:
                 'dev_ma120': dev_ma120,
                 'ma20_slope': ma20_slope,
                 'change_20d': change_20d,
+            },
+            'topping': {
+                'score': topping_score,
+                'level': topping['level'],
+                'is_topping': topping['is_topping'],
+                'signals': topping['signals'],
             },
             'prices': {
                 'current': current_price,
@@ -644,6 +695,10 @@ class SimpleStockAnalyzer:
         # 量价关系
         print("\n━━━ 量价关系 ━━━")
         print(f"{result['signals']['indicators']['量价关系']}")
+
+        # 见顶/出货检测
+        print("\n━━━ 见顶/出货检测（MA20向上但短期转弱时的关键判断）━━━")
+        print(f"{result['signals']['indicators']['见顶检测']}")
 
         # 传统指标（可选参考）
         print("\n━━━ 可选参考：传统指标 ━━━")
