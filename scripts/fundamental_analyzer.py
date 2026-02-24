@@ -27,23 +27,30 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import hashlib
+import os
+import pickle
 
 warnings.filterwarnings('ignore')
 
+_FUND_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cache', 'fundamental')
+os.makedirs(_FUND_CACHE_DIR, exist_ok=True)
 
-# 全局缓存（避免重复查询）
+# 全局内存缓存
 _FUNDAMENTAL_CACHE = {}
-_CACHE_TTL = 600  # 缓存10分钟
+_CACHE_TTL = 600
+
+# 全市场估值数据缓存（单次运行内共享，避免重复获取 ak.stock_comment_em()）
+_VALUATION_FULL_DF = None
+_VALUATION_FULL_TS = 0
+_VALUATION_FULL_TTL = 1800  # 全市场数据30分钟有效
 
 
 def _get_cache_key(*args, **kwargs):
-    """生成缓存键"""
     key_str = str(args) + str(sorted(kwargs.items()))
     return hashlib.md5(key_str.encode()).hexdigest()
 
 
 def _get_cache(key):
-    """获取缓存"""
     if key in _FUNDAMENTAL_CACHE:
         data, timestamp = _FUNDAMENTAL_CACHE[key]
         if time.time() - timestamp < _CACHE_TTL:
@@ -54,8 +61,78 @@ def _get_cache(key):
 
 
 def _set_cache(key, data):
-    """设置缓存"""
     _FUNDAMENTAL_CACHE[key] = (data, time.time())
+
+
+def _disk_cache_path(category, key):
+    """基本面磁盘缓存路径（当日有效）"""
+    today = datetime.now().strftime('%Y%m%d')
+    day_dir = os.path.join(_FUND_CACHE_DIR, today)
+    os.makedirs(day_dir, exist_ok=True)
+    safe_key = key.replace('/', '_').replace('.', '_')
+    return os.path.join(day_dir, f'{category}_{safe_key}.pkl')
+
+
+def _get_disk_cache(category, key):
+    path = _disk_cache_path(category, key)
+    if os.path.exists(path):
+        try:
+            with open(path, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+    return None
+
+
+def _set_disk_cache(category, key, data):
+    path = _disk_cache_path(category, key)
+    try:
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+def _get_valuation_full_df():
+    """获取全市场估值数据（内存 + 磁盘双层缓存）"""
+    global _VALUATION_FULL_DF, _VALUATION_FULL_TS
+
+    # 内存缓存
+    if _VALUATION_FULL_DF is not None and (time.time() - _VALUATION_FULL_TS) < _VALUATION_FULL_TTL:
+        return _VALUATION_FULL_DF
+
+    # 磁盘缓存（当日有效）
+    disk_data = _get_disk_cache('valuation_full', 'all')
+    if disk_data is not None:
+        _VALUATION_FULL_DF = disk_data
+        _VALUATION_FULL_TS = time.time()
+        return _VALUATION_FULL_DF
+
+    # 网络获取（全市场一次性获取）
+    try:
+        df = ak.stock_comment_em()
+        if df is not None and not df.empty:
+            _VALUATION_FULL_DF = df
+            _VALUATION_FULL_TS = time.time()
+            _set_disk_cache('valuation_full', 'all', df)
+            return df
+    except Exception:
+        pass
+
+    return None
+
+
+def cleanup_fundamental_cache(keep_days=3):
+    """清理过期的基本面磁盘缓存"""
+    if not os.path.exists(_FUND_CACHE_DIR):
+        return
+    cutoff = datetime.now() - timedelta(days=keep_days)
+    cutoff_str = cutoff.strftime('%Y%m%d')
+    for d in os.listdir(_FUND_CACHE_DIR):
+        full = os.path.join(_FUND_CACHE_DIR, d)
+        if d < cutoff_str and os.path.isdir(full):
+            import shutil
+            shutil.rmtree(full, ignore_errors=True)
 
 
 class FundamentalAnalyzer:
@@ -82,12 +159,18 @@ class FundamentalAnalyzer:
         self.fetch_shareholder_data()
 
     def fetch_financial_data(self):
-        """获取财务分析指标（最近3年，带缓存）"""
+        """获取财务分析指标（最近3年，内存+磁盘双层缓存）"""
+        cache_key = _get_cache_key('financial', self.stock_code)
         if self._use_cache:
-            cache_key = _get_cache_key('financial', self.stock_code)
             cached = _get_cache(cache_key)
             if cached is not None:
                 self.financial_data = cached
+                return
+
+            disk_data = _get_disk_cache('financial', self.stock_code)
+            if disk_data is not None:
+                self.financial_data = disk_data
+                _set_cache(cache_key, disk_data)
                 return
         
         try:
@@ -99,22 +182,28 @@ class FundamentalAnalyzer:
                 self.financial_data = df
                 if self._use_cache:
                     _set_cache(cache_key, df)
+                    _set_disk_cache('financial', self.stock_code, df)
         except Exception as e:
             self._fetch_errors.append(f"财务指标: {e}")
 
     def fetch_valuation_data(self):
-        """获取估值和机构评分"""
+        """获取估值和机构评分（使用全市场级缓存，避免重复获取）"""
         try:
-            df = ak.stock_comment_em()
-            if df is not None and not df.empty:
-                row = df[df['代码'] == self.stock_code]
+            full_df = _get_valuation_full_df()
+            if full_df is not None and not full_df.empty:
+                row = full_df[full_df['代码'] == self.stock_code]
                 if not row.empty:
                     self.valuation_data = row.iloc[0]
         except Exception as e:
             self._fetch_errors.append(f"估值数据: {e}")
 
     def fetch_fund_flow(self):
-        """获取近期主力资金流向"""
+        """获取近期主力资金流向（带磁盘缓存）"""
+        disk_data = _get_disk_cache('fund_flow', self.stock_code)
+        if disk_data is not None:
+            self.fund_flow_data = disk_data
+            return
+
         try:
             if self.stock_code.startswith('6'):
                 market = 'sh'
@@ -122,16 +211,23 @@ class FundamentalAnalyzer:
                 market = 'sz'
             df = ak.stock_individual_fund_flow(stock=self.stock_code, market=market)
             if df is not None and not df.empty:
-                self.fund_flow_data = df.tail(20)  # 最近20个交易日
+                self.fund_flow_data = df.tail(20)
+                _set_disk_cache('fund_flow', self.stock_code, self.fund_flow_data)
         except Exception as e:
             self._fetch_errors.append(f"资金流向: {e}")
 
     def fetch_shareholder_data(self):
-        """获取股东户数变化趋势"""
+        """获取股东户数变化趋势（带磁盘缓存）"""
+        disk_data = _get_disk_cache('shareholder', self.stock_code)
+        if disk_data is not None:
+            self.shareholder_data = disk_data
+            return
+
         try:
             df = ak.stock_zh_a_gdhs_detail_em(symbol=self.stock_code)
             if df is not None and not df.empty:
-                self.shareholder_data = df.tail(10)  # 最近10期
+                self.shareholder_data = df.tail(10)
+                _set_disk_cache('shareholder', self.stock_code, self.shareholder_data)
         except Exception as e:
             self._fetch_errors.append(f"股东户数: {e}")
 
@@ -647,6 +743,119 @@ class FundamentalAnalyzer:
                     score += 1
 
         return {'score': min(max_score, score), 'max_score': max_score}
+
+    def get_value_score(self):
+        """
+        价值评估评分（侧重"是否被低估"）用于底部反弹选股
+
+        评分维度（满分10分）：
+        - ROE 质量（0-3分）：高ROE = 好公司
+        - PE 低估（0-3分）：低PE = 便宜
+        - 营收增长（0-2分）：正增长 = 非衰退
+        - ROE+PE 联合加分（0-2分）：高ROE+低PE = 典型被低估
+
+        返回:
+            dict: {
+                'score': int,         # 0-10
+                'max_score': 10,
+                'roe': float|None,    # ROE 值
+                'pe': float|None,     # PE 值
+                'rev_growth': float|None,  # 营收增长率
+                'details': list[str], # 评分明细
+                'is_value_trap': bool,# 是否疑似价值陷阱
+            }
+        """
+        score = 0
+        max_score = 10
+        roe = None
+        pe = None
+        rev_growth = None
+        details = []
+        is_value_trap = False
+
+        # ROE（0-3分）
+        if self.financial_data is not None and not self.financial_data.empty:
+            latest = self.financial_data.iloc[-1]
+            roe = self._safe_float(latest.get('净资产收益率(%)'))
+            if roe is not None:
+                if roe >= 20:
+                    score += 3
+                    details.append(f'ROE {roe:.1f}% 优秀')
+                elif roe >= 15:
+                    score += 3
+                    details.append(f'ROE {roe:.1f}% 良好')
+                elif roe >= 10:
+                    score += 2
+                    details.append(f'ROE {roe:.1f}% 中等')
+                elif roe >= 5:
+                    score += 1
+                    details.append(f'ROE {roe:.1f}% 偏低')
+                else:
+                    details.append(f'ROE {roe:.1f}% 较差')
+                    if roe < 5:
+                        is_value_trap = True
+            else:
+                details.append('ROE 数据缺失')
+
+            # 营收增长（0-2分）
+            rev_growth = self._safe_float(latest.get('主营业务收入增长率(%)'))
+            if rev_growth is not None:
+                if rev_growth >= 15:
+                    score += 2
+                    details.append(f'营收增长 +{rev_growth:.1f}%')
+                elif rev_growth >= 0:
+                    score += 1
+                    details.append(f'营收增长 +{rev_growth:.1f}%')
+                else:
+                    details.append(f'营收下滑 {rev_growth:.1f}%')
+                    if rev_growth < -10:
+                        is_value_trap = True
+            else:
+                details.append('营收增长 数据缺失')
+
+        # PE 低估（0-3分）
+        if self.valuation_data is not None:
+            pe = self._safe_float(self.valuation_data.get('市盈率'))
+            if pe is not None and pe > 0:
+                if pe <= 10:
+                    score += 3
+                    details.append(f'PE {pe:.1f} 极度低估')
+                elif pe <= 15:
+                    score += 3
+                    details.append(f'PE {pe:.1f} 低估')
+                elif pe <= 20:
+                    score += 2
+                    details.append(f'PE {pe:.1f} 偏低')
+                elif pe <= 30:
+                    score += 1
+                    details.append(f'PE {pe:.1f} 合理')
+                else:
+                    details.append(f'PE {pe:.1f} 偏高')
+            elif pe is not None and pe < 0:
+                details.append(f'PE {pe:.1f} 亏损')
+                is_value_trap = True
+
+        # ROE+PE 联合加分（0-2分）— 高 ROE + 低 PE = 典型被低估
+        if roe is not None and pe is not None and pe > 0:
+            if roe >= 15 and pe <= 20:
+                score += 2
+                details.append('高ROE+低PE 典型被低估')
+            elif roe >= 10 and pe <= 15:
+                score += 2
+                details.append('良好ROE+极低PE 被低估')
+            elif roe >= 10 and pe <= 25:
+                score += 1
+                details.append('合理ROE+合理PE')
+
+        return {
+            'score': min(max_score, score),
+            'max_score': max_score,
+            'roe': roe,
+            'pe': pe,
+            'rev_growth': rev_growth,
+            'details': details,
+            'is_value_trap': is_value_trap,
+        }
 
 
 def main():
