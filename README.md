@@ -7,7 +7,8 @@
 - 🎯 **100分制评分**：基本面50分 + 技术面50分
 - 📊 **多级别趋势分析**：周线/日线/分时多级别判断
 - 🔄 **钟摆模型**：基于均线偏离度的买卖时机判断
-- 🚀 **多数据源**：baostock（主）+ akshare（备），自动切换
+- 🧪 **赚钱闸门**：回测扣佣金、印花税、过户费、滑点，并输出样本外验证
+- 🚀 **多数据源**：baostock（主）+ akshare（备）+ adata（可选实时行情），自动切换
 - ⚡ **智能缓存**：5-10分钟TTL，响应速度提升1000倍
 - 🛡️ **稳定可靠**：容错处理，避免限流
 
@@ -35,7 +36,11 @@ xcopy /E /I stock-intraday-trading %USERPROFILE%\.cursor\skills\stock-intraday-t
 3. **安装 Python 依赖**
 
 ```bash
-pip install baostock pandas numpy akshare adata
+python3 -m pip install -r requirements.txt
+# 如需基本面评分/选股，再安装：
+# python3 -m pip install -r requirements-fundamental.txt
+# 如需实时行情/分时增强，再安装：
+# python3 -m pip install -r requirements-realtime.txt
 ```
 
 4. **重启 Cursor**
@@ -50,7 +55,11 @@ git clone https://github.com/clcc2019/stock-intraday-trading.git
 cd stock-intraday-trading
 
 # 安装依赖
-pip install baostock pandas numpy akshare adata
+python3 -m pip install -r requirements.txt
+# 如需基本面评分/选股：
+# python3 -m pip install -r requirements-fundamental.txt
+# 如需实时行情/分时增强：
+# python3 -m pip install -r requirements-realtime.txt
 
 # 直接运行脚本
 python3 scripts/analyze_stock_simple.py 600519
@@ -119,11 +128,50 @@ python3 scripts/select_stocks.py --index hs300 --top 10
 python3 scripts/analyze_intraday_t0.py 600519
 
 # 策略回测
-python3 scripts/backtest_strategy.py 600519
+python3 scripts/backtest_strategy.py 600519 --days 900
+
+# 离线自检（不访问行情源，验证回测模拟器）
+python3 scripts/backtest_strategy.py --self-test
 
 # 生成可视化图表
 python3 scripts/generate_chart_data.py 600519 --open
 ```
+
+## 🧪 盈利研究闭环
+
+本工具不把单个技术信号视为交易结论。推荐用于实盘前，必须先过研究闸门：
+
+```bash
+# 单票：约3年数据，扣佣金/印花税/过户费/滑点，输出样本外验证
+python3 scripts/backtest_strategy.py 600519 --days 900
+
+# 多票：看策略在多个标的上的平均表现
+python3 scripts/backtest_strategy.py --multi --days 1200 --position-pct 0.5
+
+# 压力测试：提高滑点和最低年化门槛
+python3 scripts/backtest_strategy.py 600519 --slippage 0.001 --min-annual-return 8
+
+# 扫描策略C参数，优先看样本外表现
+python3 scripts/optimize_strategy_c.py --multi --days 900 --position-pct 0.5
+```
+
+默认赚钱闸门：
+- 总收益 > 0
+- 年化收益 >= 5%
+- 最大回撤 <= 15%
+- 交易次数 >= 6
+- 盈亏比 >= 1.2
+- 单笔期望 > 0
+- 相对买入持有超额 >= 0
+
+未通过闸门的股票只能作为观察候选，不能作为买入结论。
+
+当前回测脚本对比三类策略：
+- A：MACD/KDJ 核心金叉死叉信号
+- B：完整评分体系（20分制）
+- C：MA60 中线趋势持有（宽止损、长持仓）
+
+截至最近一次真实回测（2024-03-11 ~ 2026-05-25，预设4只代表股票，单票50%仓位），A/B 平均收益为负，C 平均收益为 +5.72%，但样本外闸门仍为 0/4。结论：C 是当前最优研究基线，但还不能视为已达到稳定赚钱标准。
 
 ## 📊 评分体系
 
@@ -158,7 +206,7 @@ python3 scripts/generate_chart_data.py 600519 --open
 ### 多数据源自动切换
 - 主数据源：baostock（稳定、免费、不限流）— 历史K线
 - 备用数据源：akshare（自动降级）— 历史K线备用
-- 补充数据源：adata（实时行情、资金流向、分时行情、5档盘口）
+- 可选补充数据源：adata（实时行情、资金流向、分时行情、5档盘口）
 - 智能重试和容错
 
 ### 智能缓存机制
@@ -195,6 +243,7 @@ python3 scripts/generate_chart_data.py 600519 --open
 ## 📚 参考文档
 
 - [投资哲学](references/philosophy.md) - 核心理论
+- [研究日志](references/research-log.md) - 回测证据与当前基线
 - [技术指标详解](references/indicators.md)
 - [做T策略详解](references/t0-strategies.md)
 - [量价关系分析](references/volume-price.md)
