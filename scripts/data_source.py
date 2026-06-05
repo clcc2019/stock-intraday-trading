@@ -4,9 +4,10 @@
 避免单一数据源限流导致功能不可用
 
 数据源优先级：
-1. baostock（主）：稳定、免费、不限流，来自证券交易所（历史K线）
-2. akshare（备）：历史K线备用
-3. adata（补充）：实时行情、资金流向、分时行情、5档盘口
+1. stock-api（主）：腾讯/新浪/东方财富自动兜底（历史K线、实时行情）
+2. baostock（备）：稳定、免费、不限流，来自证券交易所（历史K线、股票列表、指数成分）
+3. akshare（备）：历史K线备用
+4. adata（补充）：资金流向、分时行情、5档盘口
 
 缓存策略（增量更新）：
 - 历史K线：持久化存储，每次仅从上次最后日期补全新数据
@@ -22,8 +23,11 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import hashlib
+import json
 import os
 import pickle
+import shutil
+import subprocess
 
 warnings.filterwarnings('ignore')
 
@@ -59,6 +63,8 @@ class DataSource:
     _cache_ttl = 300
     _cache_write_count = 0
     _akshare_available = None
+    _stock_api_cli = None
+    _stock_api_cli_checked = False
 
     # 缓存命中统计
     _stats = {'hist_mem_hit': 0, 'hist_disk_hit': 0, 'hist_incremental': 0,
@@ -223,6 +229,101 @@ class DataSource:
             return f'sz.{stock_code}'
         else:
             return f'sh.{stock_code}'
+
+    @classmethod
+    def _convert_code_stock_api(cls, stock_code):
+        """转换股票代码为 stock-api 格式，如 SH600519 / SZ000651"""
+        code = str(stock_code).strip().upper()
+        if code.startswith(('SH', 'SZ', 'HK', 'US')):
+            return code
+        code = code.replace('SH.', '').replace('SZ.', '').replace('.', '')
+        if code.startswith('6'):
+            return f'SH{code}'
+        if code.startswith(('0', '3')):
+            return f'SZ{code}'
+        return f'SH{code}'
+
+    @classmethod
+    def _normalize_stock_api_code(cls, stock_api_code):
+        """把 stock-api 代码转回 6 位 A 股代码"""
+        code = str(stock_api_code).strip().upper()
+        if code.startswith(('SH', 'SZ')):
+            return code[2:]
+        return code.replace('SH.', '').replace('SZ.', '').replace('.', '')
+
+    @classmethod
+    def _get_stock_api_cli(cls, allow_npx=False):
+        """
+        获取 stock-api CLI 命令。
+
+        默认只使用本地或全局安装的 stock-api，避免选股批量场景反复 npx。
+        如需允许 npx 降级，可设置 STOCK_API_ALLOW_NPX=1。
+        """
+        if os.environ.get('STOCK_API_DISABLED', '').lower() in ('1', 'true', 'yes'):
+            return None
+
+        if cls._stock_api_cli_checked and cls._stock_api_cli:
+            return cls._stock_api_cli
+
+        if not cls._stock_api_cli_checked:
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            local_cli = os.path.join(root_dir, 'node_modules', '.bin', 'stock-api')
+            if os.path.exists(local_cli):
+                cls._stock_api_cli = [local_cli]
+            else:
+                global_cli = shutil.which('stock-api')
+                if global_cli:
+                    cls._stock_api_cli = [global_cli]
+            cls._stock_api_cli_checked = True
+
+        if cls._stock_api_cli:
+            return cls._stock_api_cli
+
+        env_allow_npx = os.environ.get('STOCK_API_ALLOW_NPX', '').lower() in ('1', 'true', 'yes')
+        if (allow_npx or env_allow_npx) and shutil.which('npx'):
+            package_name = os.environ.get('STOCK_API_NPX_PACKAGE', 'stock-api@2.7.2')
+            return ['npx', '-y', package_name]
+
+        return None
+
+    @classmethod
+    def _run_stock_api_cli(cls, args, allow_npx=False, timeout=None):
+        """调用 stock-api CLI 并解析 JSON，失败返回 None 让上层自动降级。"""
+        cmd = cls._get_stock_api_cli(allow_npx=allow_npx)
+        if not cmd:
+            return None
+
+        if timeout is None:
+            timeout = int(os.environ.get('STOCK_API_TIMEOUT', '25'))
+
+        try:
+            proc = subprocess.run(
+                cmd + args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return None
+            return json.loads(proc.stdout)
+        except Exception:
+            return None
+
+    @classmethod
+    def _estimate_stock_api_count(cls, start_date, end_date, period):
+        try:
+            start_dt = datetime.strptime(str(start_date)[:10], '%Y-%m-%d')
+            end_dt = datetime.strptime(str(end_date)[:10], '%Y-%m-%d')
+            calendar_days = max((end_dt - start_dt).days + 1, 1)
+        except Exception:
+            calendar_days = 400
+
+        if period == 'weekly':
+            return max(80, min(520, calendar_days // 5 + 12))
+        if period == 'monthly':
+            return max(36, min(240, calendar_days // 20 + 12))
+        return max(120, min(2000, int(calendar_days * 1.6) + 20))
     
     @classmethod
     def get_stock_hist_minute(cls, stock_code, start_date=None, end_date=None, adjust='qfq', period='5'):
@@ -471,24 +572,12 @@ class DataSource:
                 cls._set_cache(cache_key, result)
                 return result.copy()
 
-            # 判断缓存是否"足够新"：距今天不超过3个自然日
-            # 这种情况下用 realtime 补充当日数据即可，无需网络增量查询
             try:
                 last_dt = datetime.strptime(str(last_cached_date)[:10], '%Y-%m-%d')
-                days_stale = (datetime.now() - last_dt).days
             except ValueError:
-                days_stale = 999
+                last_dt = None
 
-            if days_stale <= 3:
-                # 缓存足够新，靠 _append_today_realtime 补充当日数据
-                cls._stats['hist_disk_hit'] += 1
-                result = cached_df[cached_df['日期'] >= start_date].copy()
-                if period == 'daily':
-                    result = cls._append_today_realtime(result, stock_code)
-                cls._set_cache(cache_key, result)
-                return result.copy()
-
-            # 缓存过旧（>3天），做增量网络请求
+            # 缓存缺到 end_date 时先做增量请求；失败才返回已有缓存。
             try:
                 next_day = (last_dt + timedelta(days=1)).strftime('%Y-%m-%d')
             except Exception:
@@ -500,6 +589,8 @@ class DataSource:
                     incremental_df['日期'] = incremental_df['日期'].astype(str).str[:10]
                     merged = pd.concat([cached_df, incremental_df], ignore_index=True)
                     merged = merged.drop_duplicates(subset=['日期'], keep='last').sort_values('日期').reset_index(drop=True)
+                    if '收盘' in merged.columns:
+                        merged['涨跌幅'] = pd.to_numeric(merged['收盘'], errors='coerce').pct_change().fillna(0) * 100
                     cls._save_hist_cache(stock_code, adjust, period, merged)
                     cls._stats['hist_incremental'] += 1
                     result = merged[merged['日期'] >= start_date].copy()
@@ -529,7 +620,14 @@ class DataSource:
 
     @classmethod
     def _fetch_hist_from_network(cls, stock_code, start_date, end_date, adjust, period):
-        """从网络获取K线数据（baostock → akshare 降级）"""
+        """从网络获取K线数据（stock-api → baostock → akshare 降级）"""
+        try:
+            df = cls._get_stock_hist_stock_api(stock_code, start_date, end_date, adjust, period)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+
         try:
             df = cls._get_stock_hist_baostock(stock_code, start_date, end_date, adjust, period)
             if df is not None and not df.empty:
@@ -548,6 +646,71 @@ class DataSource:
                 cls._akshare_available = False
 
         return None
+
+    @classmethod
+    def _get_stock_hist_stock_api(cls, stock_code, start_date, end_date, adjust, period):
+        """从 stock-api 获取历史K线，返回与现有脚本兼容的中文列"""
+        period_map = {'daily': 'day', 'weekly': 'week', 'monthly': 'month'}
+        stock_api_period = period_map.get(period)
+        if stock_api_period is None:
+            return pd.DataFrame()
+
+        adjust_map = {'qfq': 'qfq', 'hfq': 'hfq', '': 'none', None: 'none'}
+        stock_api_adjust = adjust_map.get(adjust, 'qfq')
+        count = cls._estimate_stock_api_count(start_date, end_date, period)
+        stock_api_code = cls._convert_code_stock_api(stock_code)
+
+        data = cls._run_stock_api_cli([
+            'get-klines',
+            stock_api_code,
+            '--period',
+            stock_api_period,
+            '--count',
+            str(count),
+            '--adjust',
+            stock_api_adjust,
+        ])
+
+        if not data:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data)
+        required = {'date', 'open', 'high', 'low', 'close'}
+        if df.empty or not required.issubset(set(df.columns)):
+            return pd.DataFrame()
+
+        df = df.rename(columns={
+            'date': '日期',
+            'open': '开盘',
+            'high': '最高',
+            'low': '最低',
+            'close': '收盘',
+            'volume': '成交量',
+            'source': '数据源',
+        })
+
+        df['日期'] = df['日期'].astype(str).str[:10]
+        df = df[(df['日期'] >= start_date) & (df['日期'] <= end_date)]
+        if df.empty:
+            return pd.DataFrame()
+
+        df = df.sort_values('日期').drop_duplicates(subset=['日期'], keep='last').reset_index(drop=True)
+
+        for col in ['开盘', '最高', '最低', '收盘']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        if '成交量' not in df.columns:
+            df['成交量'] = 0
+        # stock-api K线成交量来自腾讯/新浪时通常为“手”，现有策略按“股”计算量比。
+        df['成交量'] = (pd.to_numeric(df['成交量'], errors='coerce').fillna(0) * 100).astype(np.int64)
+        df['成交额'] = 0.0
+        df['换手率'] = 0.0
+        df['涨跌幅'] = df['收盘'].pct_change().fillna(0) * 100
+
+        columns = ['日期', '开盘', '最高', '最低', '收盘', '成交量', '成交额', '换手率', '涨跌幅']
+        if '数据源' in df.columns:
+            columns.append('数据源')
+        return df[columns]
     
     @classmethod
     def _get_stock_hist_baostock(cls, stock_code, start_date, end_date, adjust, period):
@@ -775,6 +938,44 @@ class DataSource:
     _realtime_cache_ts = 0  # 缓存时间戳
 
     @classmethod
+    def _get_realtime_quotes_stock_api(cls, stock_codes, allow_npx=False):
+        """从 stock-api 批量获取实时行情，返回 adata 兼容字段"""
+        if not stock_codes:
+            return None
+
+        api_codes = [cls._convert_code_stock_api(code) for code in stock_codes]
+        data = cls._run_stock_api_cli(['get-stocks'] + api_codes, allow_npx=allow_npx, timeout=35)
+        if not data:
+            return None
+
+        if isinstance(data, dict):
+            data = [data]
+
+        rows = []
+        for item in data:
+            try:
+                price = float(item.get('now') or 0)
+                yesterday = float(item.get('yesterday') or 0)
+                change = price - yesterday if yesterday > 0 else 0.0
+                percent = float(item.get('percent') or 0) * 100
+                rows.append({
+                    'stock_code': cls._normalize_stock_api_code(item.get('code')),
+                    'short_name': item.get('name') or '',
+                    'price': price,
+                    'change': change,
+                    'change_pct': percent,
+                    'volume': 0,
+                    'amount': 0.0,
+                    'source': item.get('source') or 'stock-api',
+                })
+            except Exception:
+                continue
+
+        if not rows:
+            return None
+        return pd.DataFrame(rows)
+
+    @classmethod
     def preload_realtime_prices(cls, stock_codes):
         """
         批量预加载实时行情（选股等批量场景使用）。
@@ -786,6 +987,29 @@ class DataSource:
         """
         if not cls._is_trading_hours():
             return
+
+        try:
+            batch_size = 100
+            loaded = 0
+            for i in range(0, len(stock_codes), batch_size):
+                batch = stock_codes[i:i + batch_size]
+                rt_df = cls._get_realtime_quotes_stock_api(batch)
+                if rt_df is not None and not rt_df.empty:
+                    for _, row in rt_df.iterrows():
+                        code = str(row['stock_code'])
+                        cls._realtime_cache[code] = {
+                            'price': float(row['price']) if row['price'] else 0,
+                            'volume': int(row['volume']) if row['volume'] else 0,
+                            'amount': float(row['amount']) if row['amount'] else 0,
+                            'change_pct': float(row['change_pct']) if row['change_pct'] else 0,
+                        }
+                        loaded += 1
+            if loaded:
+                cls._realtime_cache_ts = time.time()
+                print(f"   📡 已通过 stock-api 预加载 {loaded} 只股票的实时行情")
+                return
+        except Exception:
+            pass
 
         ad = _get_adata()
         if ad is None:
@@ -814,9 +1038,9 @@ class DataSource:
     @classmethod
     def _append_today_realtime(cls, df, stock_code):
         """
-        用 adata 实时行情补充当日数据行。
-        如果 baostock 返回的最新日期不是今天，且当前在交易时段，
-        则从 adata 分时数据或批量缓存中合成当日 OHLCV 并追加到 df 末尾。
+        用 stock-api/adata 实时行情补充当日数据行。
+        如果历史K线最新日期不是今天，且当前在交易时段，
+        则从批量缓存、stock-api 实时行情或 adata 分时数据合成当日 OHLCV。
         """
         if df is None or df.empty:
             return df
@@ -856,7 +1080,33 @@ class DataSource:
             df = pd.concat([df, today_row], ignore_index=True)
             return df
 
-        # 方式2：单只股票分析场景，用分时数据合成完整 OHLCV
+        # 方式2：单只股票分析场景，先用 stock-api 实时行情补当日价格
+        try:
+            rt_df = cls._get_realtime_quotes_stock_api([stock_code], allow_npx=True)
+            if rt_df is not None and not rt_df.empty:
+                row = rt_df.iloc[0]
+                price = float(row['price']) if row['price'] else 0
+                if price > 0:
+                    prev_close = float(df.iloc[-1]['收盘'])
+                    change_pct = float(row['change_pct']) if row['change_pct'] else (
+                        (price - prev_close) / prev_close * 100 if prev_close > 0 else 0
+                    )
+                    today_row = pd.DataFrame([{
+                        '日期': today_str,
+                        '开盘': price,
+                        '最高': price,
+                        '最低': price,
+                        '收盘': price,
+                        '成交量': int(row['volume']) if row['volume'] else 0,
+                        '成交额': float(row['amount']) if row['amount'] else 0.0,
+                        '换手率': 0.0,
+                        '涨跌幅': round(change_pct, 2),
+                    }])
+                    return pd.concat([df, today_row], ignore_index=True)
+        except Exception:
+            pass
+
+        # 方式3：adata 分时数据合成完整 OHLCV
         ad = _get_adata()
         if ad is None:
             return df
@@ -961,7 +1211,7 @@ class DataSource:
     @classmethod
     def get_realtime_quote(cls, stock_codes):
         """
-        获取实时行情（来源：adata，新浪/腾讯）
+        获取实时行情（来源：stock-api，自动降级到 adata）
         
         参数:
             stock_codes: 股票代码列表，如 ['600519', '002594']
@@ -974,6 +1224,11 @@ class DataSource:
         cached = cls._get_cache(cache_key)
         if cached is not None:
             return cached.copy()
+
+        stock_api_df = cls._get_realtime_quotes_stock_api(stock_codes, allow_npx=True)
+        if stock_api_df is not None and not stock_api_df.empty:
+            cls._cache[cache_key] = (stock_api_df, time.time())
+            return stock_api_df.copy()
 
         ad = _get_adata()
         if ad is None:

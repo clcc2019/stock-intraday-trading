@@ -12,8 +12,7 @@
 性能优化：
 - 磁盘缓存：日K线数据当日缓存，重复运行秒出结果
 - 两阶段筛选：先快速技术面过滤，通过的才做基本面（减少80%网络请求）
-- 多指数合并：支持 --index core（沪深300+上证50去重）
-- 并发获取：使用线程池并发拉取K线数据
+- 多指数合并：默认使用 --index wide（沪深300+中证500去重）
 """
 
 import pandas as pd
@@ -40,6 +39,8 @@ from technical import (
 class TrendStockSelector:
     """趋势选股器 — 基于均线+趋势+钟摆模型（高性能版）"""
 
+    DEFAULT_INDEX = 'wide'
+
     # 预定义指数映射
     INDEX_MAP = {
         'hs300': ('沪深300', ['sh.000300']),
@@ -47,6 +48,7 @@ class TrendStockSelector:
         'sz50':  ('上证50',  ['sh.000016']),
         'core':  ('核心指数(沪深300+上证50)', ['sh.000300', 'sh.000016']),
         'wide':  ('宽基指数(沪深300+中证500)', ['sh.000300', 'sh.000905']),
+        'broad': ('宽基指数(沪深300+中证500)', ['sh.000300', 'sh.000905']),
     }
 
     def __init__(self, index=None, sector=None, top_n=30, no_fundamental=False):
@@ -65,9 +67,8 @@ class TrendStockSelector:
             elif self.sector:
                 return self._get_sector_stocks()
             else:
-                # 默认使用核心指数（而非全A股），大幅提速
-                print("💡 未指定指数，默认使用核心指数(沪深300+上证50)，可用 --index wide 扩大范围")
-                self.index = 'core'
+                print("💡 未指定指数，默认使用宽基指数(沪深300+中证500，约800只)")
+                self.index = self.DEFAULT_INDEX
                 return self._get_index_stocks()
         except Exception as e:
             print(f"❌ 获取股票池失败: {e}")
@@ -87,13 +88,14 @@ class TrendStockSelector:
         if key not in self.INDEX_MAP:
             print(f"⚠️ 不支持的指数: {self.index}")
             print(f"   支持: {', '.join(self.INDEX_MAP.keys())}, all(全A股)")
-            print("   将使用 core（沪深300+上证50）")
-            key = 'core'
+            print("   将使用 wide（沪深300+中证500）")
+            key = self.DEFAULT_INDEX
 
         name, index_codes = self.INDEX_MAP[key]
         print(f"📊 从{name}中选股...")
 
         all_codes = {}  # code -> name，用于去重
+        failed_indexes = []
         for idx_code in index_codes:
             try:
                 df = DataSource.get_index_stocks(idx_code)
@@ -102,8 +104,18 @@ class TrendStockSelector:
                         code = row['代码']
                         if code not in all_codes:
                             all_codes[code] = row['名称']
+                else:
+                    failed_indexes.append(idx_code)
             except Exception as e:
                 print(f"⚠️ 获取 {idx_code} 成分股失败: {e}")
+                failed_indexes.append(idx_code)
+
+        if failed_indexes and len(index_codes) > 1:
+            print("⚠️ 宽基指数成分获取不完整，回退全A股列表，避免股票池缩减为单一指数")
+            fallback_codes = self._get_all_a_stocks()
+            if fallback_codes:
+                return fallback_codes
+            print("⚠️ 全A股回退失败，将使用已获取的部分指数成分")
 
         if all_codes:
             self.stock_names.update(all_codes)
@@ -113,7 +125,7 @@ class TrendStockSelector:
 
         # 备用方案
         print("⚠️ 获取指数成分股失败，使用备用方案...")
-        return self._get_all_a_stocks()[:300]
+        return self._get_all_a_stocks()
 
     def _get_sector_stocks(self):
         """获取板块成分股（baostock 不支持板块，使用全市场）"""
@@ -122,7 +134,7 @@ class TrendStockSelector:
 
     def _get_all_a_stocks(self):
         """获取全A股列表（使用 baostock）"""
-        print("📊 获取全A股列表（较慢，建议使用 --index core）...")
+        print("📊 获取全A股列表（较慢，日常筛选建议使用 --index wide）...")
         try:
             df = DataSource.get_stock_list()
             if df is not None and not df.empty:
@@ -861,16 +873,18 @@ def main():
   bottom   底部反弹选股 — 基本面好+跌够了+底部信号，抄底不抄死
 
 指数选项:
-  core   沪深300+上证50（默认，约320只，推荐日常使用）
+  wide   沪深300+中证500（默认，约800只，推荐日常使用）
+  broad  wide 的别名
+  core   沪深300+上证50（约300只，兼容旧用法）
   hs300  沪深300（300只）
   zz500  中证500（500只）
   sz50   上证50（50只，最快）
-  wide   沪深300+中证500（约800只）
   all    全A股（5000+只，较慢）
 
 示例:
-  python3 select_stocks.py                          # 默认趋势选股
-  python3 select_stocks.py --strategy bottom         # 底部反弹选股
+  python3 select_stocks.py                            # 默认从约800只宽基成分中趋势选股
+  python3 select_stocks.py --strategy bottom          # 默认从宽基中筛底部反弹
+  python3 select_stocks.py --index all --top 50       # 全A股筛选
   python3 select_stocks.py --strategy bottom --index wide  # 宽基底部反弹
   python3 select_stocks.py --index sz50              # 上证50趋势选股
   python3 select_stocks.py --no-fundamental          # 跳过基本面（纯技术面）
@@ -878,7 +892,12 @@ def main():
     )
     parser.add_argument('--strategy', type=str, default='trend', choices=['trend', 'bottom'],
                         help='选股策略: trend(趋势,默认), bottom(底部反弹)')
-    parser.add_argument('--index', type=str, help='指数: core(默认), hs300, zz500, sz50, wide, all')
+    parser.add_argument(
+        '--index',
+        type=str,
+        default=TrendStockSelector.DEFAULT_INDEX,
+        help='股票池: wide(默认), broad, core, hs300, zz500, sz50, all',
+    )
     parser.add_argument('--sector', type=str, help='板块名称，如: 白酒, 新能源, 半导体')
     parser.add_argument('--top', type=int, default=30, help='显示前N只股票（默认30）')
     parser.add_argument('--no-fundamental', action='store_true', help='跳过基本面分析（纯技术面筛选更快）')

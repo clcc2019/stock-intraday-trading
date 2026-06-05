@@ -91,6 +91,9 @@ description: 股票趋势分析与日内做T。100分制评分（基本面50+技
 ### 1. 意图识别
 - "选股/筛选/推荐" → 趋势选股脚本（默认 `--strategy trend`）
 - "底部/反弹/超跌/低估/抄底/被低估/错杀" → 底部反弹选股（`--strategy bottom`）
+- "全市场/全A股/不限定指数" → 增加 `--index all`
+- "中小盘/中证500" → 增加 `--index zz500`
+- "沪深300/大盘蓝筹/快速筛选" → 按需使用 `--index hs300` 或 `--index sz50`
 - "做T/日内/分时" → T+0脚本
 - "回测/历史收益" → 回测脚本
 - "图表/K线图" → 图表生成脚本
@@ -104,8 +107,9 @@ description: 股票趋势分析与日内做T。100分制评分（基本面50+技
 **趋势选股**（追涨不追高，默认策略）：
 ```bash
 cd .cursor/skills/stock-intraday-trading && python3 scripts/select_stocks.py
-# 默认使用核心指数(沪深300+上证50,约320只)，首次约60s，缓存后约10s
-# --index 选项: core(默认), hs300, zz500, sz50(最快), wide(沪深300+中证500), all(全A股)
+# 默认使用宽基指数(沪深300+中证500,约800只)，覆盖大中盘股票
+# --index 选项: wide(默认), broad(wide别名), core, hs300, zz500, sz50(最快), all(全A股)
+# 用户未限定范围时使用默认 wide；明确要求全市场时使用 --index all
 # --no-fundamental   跳过基本面（纯技术面筛选更快）
 # --top 30           显示前N只（默认30）
 ```
@@ -115,7 +119,7 @@ cd .cursor/skills/stock-intraday-trading && python3 scripts/select_stocks.py
 cd .cursor/skills/stock-intraday-trading && python3 scripts/select_stocks.py --strategy bottom
 # 寻找基本面优秀但被低估、即将触底反弹的股票
 # --strategy bottom   启用底部反弹策略
-# --index wide        建议用宽基指数，底部股票在中小盘更多
+# 默认已使用 --index wide；需要覆盖全部A股时显式使用 --index all
 # --no-fundamental    跳过基本面（纯技术面底部信号）
 ```
 
@@ -164,6 +168,8 @@ cd .cursor/skills/stock-intraday-trading && python3 scripts/generate_chart_data.
 - 闸门未通过但技术/基本面较好，只输出“观察候选”和失败原因。
 - 当前研究基线：优先查看策略C；A/B 在 2024-03-11 ~ 2026-05-25 的代表股票回测中整体为负。
 - 如果依赖缺失，先提示安装：`python3 -m pip install -r requirements.txt`，不要用理论替代脚本结果。
+- 行情数据优先使用 `stock-api`（腾讯/新浪/东方财富自动兜底）；如缺少 Node 依赖，提示在 skill 目录运行 `npm install`。未安装时脚本会自动降级到 baostock/akshare。
+- 股票列表和指数成分仍由 baostock 提供；`stock-api` 主要用于历史K线和实时行情。
 - `akshare` 基本面属于选股增强；如需基本面评分，安装 `python3 -m pip install -r requirements-fundamental.txt`。
 - `adata` 实时行情属于可选增强；如需分时/实时补充，安装 `python3 -m pip install -r requirements-realtime.txt`。
 

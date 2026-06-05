@@ -8,7 +8,7 @@
 - 📊 **多级别趋势分析**：周线/日线/分时多级别判断
 - 🔄 **钟摆模型**：基于均线偏离度的买卖时机判断
 - 🧪 **赚钱闸门**：回测扣佣金、印花税、过户费、滑点，并输出样本外验证
-- 🚀 **多数据源**：baostock（主）+ akshare（备）+ adata（可选实时行情），自动切换
+- 🚀 **多数据源**：stock-api（主）+ baostock/akshare（备）+ adata（可选分时/资金），自动切换
 - ⚡ **智能缓存**：5-10分钟TTL，响应速度提升1000倍
 - 🛡️ **稳定可靠**：容错处理，避免限流
 
@@ -41,6 +41,9 @@ python3 -m pip install -r requirements.txt
 # python3 -m pip install -r requirements-fundamental.txt
 # 如需实时行情/分时增强，再安装：
 # python3 -m pip install -r requirements-realtime.txt
+
+# 推荐安装 Node 行情源（stock-api: 腾讯/新浪/东方财富自动兜底）
+npm install
 ```
 
 4. **重启 Cursor**
@@ -60,6 +63,9 @@ python3 -m pip install -r requirements.txt
 # python3 -m pip install -r requirements-fundamental.txt
 # 如需实时行情/分时增强：
 # python3 -m pip install -r requirements-realtime.txt
+
+# 推荐安装 Node 行情源（stock-api）
+npm install
 
 # 直接运行脚本
 python3 scripts/analyze_stock_simple.py 600519
@@ -122,7 +128,9 @@ AI 会自动执行做T分析脚本，输出：
 python3 scripts/analyze_stock_simple.py 600519
 
 # 选股
-python3 scripts/select_stocks.py --index hs300 --top 10
+python3 scripts/select_stocks.py --top 10
+# 默认股票池为沪深300+中证500（约800只）
+# 全A股筛选：python3 scripts/select_stocks.py --index all --top 30
 
 # 做T分析
 python3 scripts/analyze_intraday_t0.py 600519
@@ -204,10 +212,13 @@ python3 scripts/optimize_strategy_c.py --multi --days 900 --position-pct 0.5
 ## 🔧 性能优化
 
 ### 多数据源自动切换
-- 主数据源：baostock（稳定、免费、不限流）— 历史K线
+- 主数据源：stock-api（腾讯/新浪/东方财富自动兜底）— 历史K线、实时行情
+- 备用数据源：baostock（稳定、免费、不限流）— 历史K线、股票列表、指数成分
 - 备用数据源：akshare（自动降级）— 历史K线备用
-- 可选补充数据源：adata（实时行情、资金流向、分时行情、5档盘口）
+- 可选补充数据源：adata（资金流向、分时行情、5档盘口）
 - 智能重试和容错
+
+`stock-api` 是 Node.js 包，安装后 Python 脚本会自动发现 `node_modules/.bin/stock-api` 并优先使用。未安装或接口失败时会自动降级，不会影响原有 baostock/akshare 流程。
 
 ### 智能缓存机制
 - 技术面数据：5分钟缓存

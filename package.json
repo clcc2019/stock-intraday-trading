@@ -1,0 +1,8 @@
+{
+  "name": "stock-intraday-trading-skill",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "stock-api": "2.7.2"
+  }
+}
